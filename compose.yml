@@ -7,7 +7,7 @@ services:
       - "9000:9000"
     environment:
       POSTA_DB_URL: "host=posta-db user=posta password=posta dbname=posta port=5432 sslmode=disable"
-      POSTA_REDIS_ADDR: "posta-redis:6379"
+      POSTA_REDIS_ADDR: "athenas_redis:6379"
       # Local quick start only. Production rejects the placeholder credentials
       # below, so this file declares itself dev; see examples/ for a deployable
       # template that requires real secrets.
@@ -24,8 +24,11 @@ services:
     depends_on:
       posta-db:
         condition: service_healthy
-      posta-redis:
-        condition: service_healthy
+      #athenas_redis:
+      #  condition: service_healthy
+    networks:
+      - default
+      - athnet
     restart: unless-stopped
 
   worker:
@@ -35,14 +38,18 @@ services:
     command: ["worker"]
     environment:
       POSTA_DB_URL: "host=posta-db user=posta password=posta dbname=posta port=5432 sslmode=disable"
-      POSTA_REDIS_ADDR: "posta-redis:6379"
+      POSTA_REDIS_ADDR: "athenas_redis:6379"
+      POSTA_ENV: "dev"
       POSTA_WORKER_CONCURRENCY: "10"
       POSTA_WORKER_MAX_RETRIES: "5"
     depends_on:
       posta-db:
         condition: service_healthy
-      posta-redis:
-        condition: service_healthy
+      #athenas_redis:
+      #  condition: service_healthy
+    networks:
+      - default
+      - athnet
     restart: unless-stopped
 
   posta-db:
@@ -59,16 +66,20 @@ services:
       timeout: 5s
       retries: 5
 
-  posta-redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+  #posta-redis:
+  #  image: redis:7-alpine
+  #  volumes:
+  #    - redis_data:/data
+  #  healthcheck:
+  #    test: ["CMD", "redis-cli", "ping"]
+  #    interval: 5s
+  #    timeout: 5s
+  #    retries: 5
 
 volumes:
   db_data:
   redis_data:
+
+networks:
+  athnet:
+    external: true
