@@ -240,7 +240,7 @@ onMounted(load);
               <dt>Type</dt>
               <dd>{{ check.record.type }}</dd>
               <dt>Name</dt>
-              <dd>{{ check.record.name }}</dd>
+              <dd>{{ check.record.host }}</dd>
               <dt>Value</dt>
               <dd class="wrap">{{ check.record.value }}</dd>
             </dl>

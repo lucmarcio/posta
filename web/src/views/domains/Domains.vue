@@ -89,7 +89,7 @@ async function copyAllRecords() {
   if (!d || !d.dns_records) return
   const lines = ['Type\tHost\tValue']
   for (const row of recordRows.value) {
-    lines.push(`${row.record.type}\t${row.record.name}\t${row.record.value}`)
+    lines.push(`${row.record.type}\t${row.record.host}\t${row.record.value}`)
   }
   await copy(lines.join('\n'), 'All records')
 }
@@ -286,14 +286,14 @@ const { watchClickStart, confirmClickEnd } = useModalSafeClose(() => {
                           <div class="dns-field">
                             <div class="dns-field-label">Host / Name</div>
                             <div class="dns-field-row">
-                              <code class="dns-field-value">{{ row.record.name }}</code>
+                              <code class="dns-field-value">{{ row.record.host }}</code>
                               <button type="button" class="btn btn-ghost btn-xs"
-                                @click="copy(row.record.name, 'Host')">Copy</button>
+                                @click="copy(row.record.host, 'Host')">Copy</button>
                             </div>
-                            <div v-if="hostShortForm(row.record.name, domain.domain) !== row.record.name"
+                            <div v-if="hostShortForm(row.record.host, domain.domain) !== row.record.host"
                               class="dns-field-hint">
                               Some providers (Cloudflare, Route 53, GoDaddy) only accept the subdomain part —
-                              use <code>{{ hostShortForm(row.record.name, domain.domain) }}</code> instead.
+                              use <code>{{ hostShortForm(row.record.host, domain.domain) }}</code> instead.
                             </div>
                           </div>
 
