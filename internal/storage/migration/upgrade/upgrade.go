@@ -19,6 +19,7 @@ import (
 	"github.com/goposta/posta/internal/models"
 	"github.com/jkaninda/logger"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Settings keys persisted in the platform `settings` table.
@@ -151,5 +152,7 @@ func markAllApplied(db *gorm.DB, binaryVersion string) error {
 			AppliedAt:  now,
 		})
 	}
-	return db.Create(&rows).Error
+	// Dev binaries never persist app.version, so every dev boot looks fresh;
+	// skip rows already sealed by a previous boot instead of failing.
+	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error
 }
