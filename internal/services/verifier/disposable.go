@@ -3,11 +3,34 @@
 
 package verifier
 
-import "strings"
+import (
+	_ "embed"
+	"strings"
+)
 
-// disposableDomains is a representative (non-exhaustive) set of throwaway email
-// providers.
-var disposableDomains = map[string]bool{
+//go:embed data/disposable_domains.txt
+var disposableList string
+
+// disposableDomains merges the embedded community blocklist with a few
+// hand-picked extras. Built once at package init.
+var disposableDomains = func() map[string]bool {
+	set := make(map[string]bool, 8192)
+	for _, line := range strings.Split(disposableList, "\n") {
+		d := strings.ToLower(strings.TrimSpace(line))
+		if d == "" || strings.HasPrefix(d, "#") {
+			continue
+		}
+		set[d] = true
+	}
+	for d := range extraDisposable {
+		set[d] = true
+	}
+	return set
+}()
+
+// extraDisposable is a representative set of hand-picked throwaway email
+// providers merged into disposableDomains alongside the embedded list.
+var extraDisposable = map[string]bool{
 	"mailinator.com":    true,
 	"guerrillamail.com": true,
 	"guerrillamail.net": true,
@@ -66,9 +89,17 @@ var roleLocalParts = map[string]bool{
 	"nepasrepondre": true,
 }
 
-// isDisposable reports whether the domain belongs to a known throwaway provider.
+// isDisposable reports whether the domain, or any parent domain above the TLD,
+// is a known throwaway provider (x.mailinator.com matches mailinator.com).
 func isDisposable(domain string) bool {
-	return disposableDomains[strings.ToLower(domain)]
+	d := strings.ToLower(strings.TrimSpace(domain))
+	for strings.Contains(d, ".") {
+		if disposableDomains[d] {
+			return true
+		}
+		d = d[strings.IndexByte(d, '.')+1:]
+	}
+	return false
 }
 
 // isRoleAccount reports whether the local part is a role/function mailbox.

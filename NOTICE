@@ -10,3 +10,9 @@ or (at your option) any later version. The full text is distributed with
 this software in the LICENSE file, and is also available at:
 
     https://www.gnu.org/licenses/agpl-3.0.html
+
+Third-party data
+-----------------
+
+internal/services/verifier/data/disposable_domains.txt — disposable-email-domains
+(https://github.com/disposable-email-domains/disposable-email-domains), CC0 1.0.

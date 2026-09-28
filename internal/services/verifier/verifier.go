@@ -68,6 +68,7 @@ type Result struct {
 	Score             int       `json:"score"`
 	Checks            Checks    `json:"checks"`
 	Reason            string    `json:"reason,omitempty"`
+	Suggestion        string    `json:"suggestion,omitempty"`
 	MailboxVerified   bool      `json:"mailbox_verified"`
 	Suppressed        bool      `json:"suppressed"`
 	PreviouslyBounced bool      `json:"previously_bounced"`
@@ -182,6 +183,10 @@ func (s *Service) compute(ctx context.Context, email string) *Result {
 
 	at := strings.LastIndex(email, "@")
 	local, domain := email[:at], email[at+1:]
+
+	if sug := suggestDomain(domain); sug != "" {
+		r.Suggestion = local + "@" + sug
+	}
 
 	disposable := isDisposable(domain)
 	role := isRoleAccount(local)
