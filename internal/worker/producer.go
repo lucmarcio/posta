@@ -160,6 +160,27 @@ func (p *Producer) EnqueueMessageProcess(messageID uint) error {
 	return nil
 }
 
+// EnqueueVerifyJob enqueues a bulk verification job. The TaskID is derived
+// from the job ID, so enqueueing the same job twice is a no-op.
+func (p *Producer) EnqueueVerifyJob(jobID uint) error {
+	task, err := NewVerifyJobTask(jobID,
+		asynq.Queue(QueueLow),
+		asynq.MaxRetry(5),
+		asynq.Timeout(2*time.Hour),
+		asynq.TaskID(fmt.Sprintf("verify:job:%d", jobID)),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create verify job task: %w", err)
+	}
+	if _, err := p.client.Enqueue(task); err != nil {
+		if errors.Is(err, asynq.ErrTaskIDConflict) {
+			return nil
+		}
+		return fmt.Errorf("failed to enqueue verify job task: %w", err)
+	}
+	return nil
+}
+
 // Close closes the underlying Asynq client.
 func (p *Producer) Close() error {
 	return p.client.Close()

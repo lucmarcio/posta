@@ -28,6 +28,7 @@ import (
 	"github.com/goposta/posta/internal/services/smtprelay"
 	"github.com/goposta/posta/internal/services/tracking"
 	"github.com/goposta/posta/internal/services/updatecheck"
+	"github.com/goposta/posta/internal/services/verifier"
 	"github.com/goposta/posta/internal/services/webhook"
 	"github.com/goposta/posta/internal/services/workermon"
 	workspacesvc "github.com/goposta/posta/internal/services/workspace"
@@ -475,6 +476,15 @@ func startEmbeddedWorker(db *gorm.DB,
 	mux.HandleFunc(worker.TypeCampaignStart, campaignProcessor.HandleCampaignStart)
 	mux.HandleFunc(worker.TypeCampaignBatch, campaignProcessor.HandleCampaignBatch)
 	mux.HandleFunc(jobs.TypeDailyReport, dailyReportHandler.ProcessTask)
+
+	// Bulk email verification jobs. cfg.Redis.Client is the client InitStorage
+	// built with storage.NewRedis(cfg.Redis.RedisOptions()); it backs the cache.
+	verifyJobHandler := worker.NewVerifyJobHandler(
+		repositories.NewEmailVerifyJobRepository(db),
+		verifier.FromConfig(cfg, cfg.Redis.Client, repositories.NewSuppressionRepository(db), repositories.NewBounceRepository(db)),
+		repositories.NewSuppressionRepository(db),
+	)
+	mux.HandleFunc(worker.TypeVerifyJob, verifyJobHandler.ProcessTask)
 
 	if cfg.InboundEnabled {
 		inboundHandler := worker.NewInboundProcessHandler(

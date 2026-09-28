@@ -17,6 +17,7 @@ import (
 	"github.com/goposta/posta/internal/services/inbound"
 	"github.com/goposta/posta/internal/services/notification"
 	"github.com/goposta/posta/internal/services/tracking"
+	"github.com/goposta/posta/internal/services/verifier"
 	"github.com/goposta/posta/internal/services/workermon"
 	"github.com/goposta/posta/internal/storage/blob"
 	"github.com/goposta/posta/internal/storage/repositories"
@@ -158,6 +159,15 @@ func runWorker() error {
 	mux.HandleFunc(worker.TypeCampaignStart, campaignProcessor.HandleCampaignStart)
 	mux.HandleFunc(worker.TypeCampaignBatch, campaignProcessor.HandleCampaignBatch)
 	mux.HandleFunc(jobs.TypeDailyReport, dailyReportHandler.ProcessTask)
+
+	// Bulk email verification jobs. cfg.Redis.Client is the client InitStorage
+	// built with storage.NewRedis(cfg.Redis.RedisOptions()); it backs the cache.
+	verifyJobHandler := worker.NewVerifyJobHandler(
+		repositories.NewEmailVerifyJobRepository(db),
+		verifier.FromConfig(cfg, cfg.Redis.Client, repositories.NewSuppressionRepository(db), repositories.NewBounceRepository(db)),
+		repositories.NewSuppressionRepository(db),
+	)
+	mux.HandleFunc(worker.TypeVerifyJob, verifyJobHandler.ProcessTask)
 
 	if cfg.InboundEnabled {
 		inboundHandler := worker.NewInboundProcessHandler(

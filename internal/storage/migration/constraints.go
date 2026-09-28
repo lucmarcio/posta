@@ -160,4 +160,8 @@ func rebuildUniqueIndexes(db *gorm.DB) {
 		CREATE UNIQUE INDEX idx_sub_scope_email ON subscribers (workspace_id, email) WHERE workspace_id IS NOT NULL;
 	EXCEPTION WHEN others THEN NULL;
 	END $$`)
+
+	// Idempotency: one job per (workspace, Idempotency-Key). NULL keys are free.
+	db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_verify_job_idempotency
+		ON email_verify_jobs (workspace_id, idempotency_key) WHERE idempotency_key IS NOT NULL`)
 }

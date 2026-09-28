@@ -17,6 +17,7 @@ const (
 	TypeInboundParse   = "inbound:parse"
 	TypeInboundProcess = "inbound:process"
 	TypeMessageProcess = "message:process"
+	TypeVerifyJob      = "verify:job"
 
 	QueueTransactional = queues.Transactional
 	QueueBulk          = queues.Bulk
@@ -94,4 +95,17 @@ func NewMessageProcessTask(id uint, opts ...asynq.Option) (*asynq.Task, error) {
 		return nil, err
 	}
 	return asynq.NewTask(TypeMessageProcess, payload, opts...), nil
+}
+
+type VerifyJobPayload struct {
+	JobID uint `json:"job_id"`
+}
+
+// NewVerifyJobTask creates an Asynq task that processes a bulk verification job.
+func NewVerifyJobTask(jobID uint, opts ...asynq.Option) (*asynq.Task, error) {
+	payload, err := json.Marshal(VerifyJobPayload{JobID: jobID})
+	if err != nil {
+		return nil, err
+	}
+	return asynq.NewTask(TypeVerifyJob, payload, opts...), nil
 }
