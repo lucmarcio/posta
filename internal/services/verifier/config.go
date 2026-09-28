@@ -19,5 +19,12 @@ func FromConfig(cfg *config.Config, rc *redis.Client, sup *repositories.Suppress
 		MXTTL:       time.Duration(cfg.EmailVerifyMXCacheTTLHours) * time.Hour,
 		RateHourly:  cfg.EmailVerifyRateHourly,
 		Concurrency: cfg.EmailVerifyConcurrency,
+		SMTPEnabled: cfg.EmailVerifySMTPEnabled,
+		SMTP: ProbeOptions{
+			HeloName: cfg.EmailVerifySMTPHelo,
+			MailFrom: cfg.EmailVerifySMTPFrom,
+			Timeout:  time.Duration(cfg.EmailVerifySMTPTimeoutSeconds) * time.Second,
+			PerHost:  cfg.EmailVerifySMTPPerHost,
+		},
 	})
 }

@@ -194,7 +194,7 @@ func (r *Router) apiAuthRoutes() []okapi.RouteDefinition {
 			Handler:     okapi.H(r.h.verify.Verify),
 			Group:       apiAuth,
 			Summary:     "Verify an email address",
-			Description: "Check whether an email address is valid/deliverable (syntax, disposable/role detection, MX records, and the caller's suppression/bounce history). Results are cached to avoid repeated lookups.",
+			Description: "Check whether an email address is valid/deliverable (syntax, disposable/role detection, MX records, and the caller's suppression/bounce history). Results are cached to avoid repeated lookups. When POSTA_EMAIL_VERIFY_SMTP_ENABLED=true, the address is also probed via SMTP RCPT and catch-all domains are reported as accept_all.",
 			Request:     &handlers.VerifyAddressRequest{},
 			Response:    &dto.Response[verifier.Result]{},
 			Options: []okapi.RouteOption{

@@ -6,6 +6,7 @@ package config
 import (
 	"crypto/tls"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -38,9 +39,18 @@ type Config struct {
 	EmailVerifyMXCacheTTLHours int
 	EmailVerifyRateHourly      int // per-user hourly cap; 0 disables
 	EmailVerifyConcurrency     int // max domains resolved in parallel per batch
-	AdminEmail                 string
-	AdminPassword              string
-	OpenAPIDocs                bool
+
+	// EmailVerifySMTPEnabled turns on the optional SMTP RCPT probe within
+	// email verification; off by default (RCPT probing can be blocked or
+	// rate-limited by receiving servers, and some networks block outbound 25).
+	EmailVerifySMTPEnabled        bool
+	EmailVerifySMTPHelo           string // EHLO/HELO name; defaults to AppWebURL's host, or "localhost"
+	EmailVerifySMTPFrom           string // MAIL FROM address; defaults to "verify@<helo>"
+	EmailVerifySMTPTimeoutSeconds int    // dial/command timeout; a whole probe session is bounded by 3x this
+	EmailVerifySMTPPerHost        int    // max concurrent probe sessions to one MX host
+	AdminEmail                    string
+	AdminPassword                 string
+	OpenAPIDocs                   bool
 	// AllowDowngrade lets the server boot even when the binary's version is
 	// older than the version recorded in the database. Off by default.
 	AllowDowngrade  bool
@@ -243,6 +253,10 @@ func New() *Config {
 	}
 	// Resolved first so the worker's probe listener can default to it.
 	port := goutils.EnvInt("POSTA_PORT", 9000)
+	// Resolved first so the SMTP probe's HELO/MAIL FROM defaults can use it.
+	appWebURL := goutils.Env("POSTA_WEB_URL", "")
+	smtpHelo := goutils.Env("POSTA_EMAIL_VERIFY_SMTP_HELO", smtpHeloDefault(appWebURL))
+	smtpFrom := goutils.Env("POSTA_EMAIL_VERIFY_SMTP_FROM", "verify@"+smtpHelo)
 
 	return &Config{
 		Database: DatabaseConfig{
@@ -268,17 +282,24 @@ func New() *Config {
 		EmailVerifyMXCacheTTLHours: goutils.EnvInt("POSTA_EMAIL_VERIFY_MX_CACHE_TTL_HOURS", 24),
 		EmailVerifyRateHourly:      goutils.EnvInt("POSTA_EMAIL_VERIFY_RATE_HOURLY", 1000),
 		EmailVerifyConcurrency:     goutils.EnvInt("POSTA_EMAIL_VERIFY_CONCURRENCY", 16),
-		AdminEmail:                 goutils.Env("POSTA_ADMIN_EMAIL", "admin@example.com"),
-		AdminPassword:              goutils.Env("POSTA_ADMIN_PASSWORD", "admin1234"),
-		OpenAPIDocs:                goutils.EnvBool("POSTA_OPENAPI_DOCS", true),
-		AllowDowngrade:             goutils.EnvBool("POSTA_ALLOW_DOWNGRADE", false),
-		securitySchemes:            okapi.SecuritySchemes{},
+
+		EmailVerifySMTPEnabled:        goutils.EnvBool("POSTA_EMAIL_VERIFY_SMTP_ENABLED", false),
+		EmailVerifySMTPHelo:           smtpHelo,
+		EmailVerifySMTPFrom:           smtpFrom,
+		EmailVerifySMTPTimeoutSeconds: goutils.EnvInt("POSTA_EMAIL_VERIFY_SMTP_TIMEOUT_SECONDS", 10),
+		EmailVerifySMTPPerHost:        goutils.EnvInt("POSTA_EMAIL_VERIFY_SMTP_PER_HOST", 2),
+
+		AdminEmail:      goutils.Env("POSTA_ADMIN_EMAIL", "admin@example.com"),
+		AdminPassword:   goutils.Env("POSTA_ADMIN_PASSWORD", "admin1234"),
+		OpenAPIDocs:     goutils.EnvBool("POSTA_OPENAPI_DOCS", true),
+		AllowDowngrade:  goutils.EnvBool("POSTA_ALLOW_DOWNGRADE", false),
+		securitySchemes: okapi.SecuritySchemes{},
 
 		MetricsEnabled:  goutils.EnvBool("POSTA_METRICS_ENABLED", false),
 		UpdateCheck:     goutils.EnvBool("POSTA_UPDATE_CHECK", true),
 		PlanEnforcement: goutils.EnvBool("POSTA_PLAN_ENFORCEMENT", false),
 		WebDir:          goutils.Env("POSTA_WEB_DIR", ""),
-		AppWebURL:       goutils.Env("POSTA_WEB_URL", ""),
+		AppWebURL:       appWebURL,
 		ApiBaseURL:      goutils.Env("POSTA_API_URL", ""),
 
 		CORSOrigins: goutils.Env("POSTA_CORS_ORIGINS", "*"),
@@ -352,6 +373,20 @@ func New() *Config {
 		SMTPRelayRateLimit:      goutils.EnvInt("POSTA_SMTP_RELAY_RATE_LIMIT", 60),
 		SMTPRelayRateWindow:     goutils.EnvInt("POSTA_SMTP_RELAY_RATE_WINDOW", 60),
 	}
+}
+
+// smtpHeloDefault extracts the host from webURL for use as the email
+// verification probe's HELO/MAIL FROM name, falling back to "localhost" when
+// webURL is empty or does not parse to a usable host.
+func smtpHeloDefault(webURL string) string {
+	if webURL == "" {
+		return "localhost"
+	}
+	u, err := url.Parse(webURL)
+	if err != nil || u.Hostname() == "" {
+		return "localhost"
+	}
+	return u.Hostname()
 }
 
 // removedEnvVars are settings that no longer do anything. Setting one is not an

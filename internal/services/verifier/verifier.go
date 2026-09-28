@@ -6,8 +6,12 @@
 // history, disposable/role detection, MX lookup) and caches the intrinsic result
 // in Redis so the same address and domain are not re-checked on every call.
 //
-// Note: the MVP does not perform an SMTP RCPT probe, so mailbox existence is not
-// confirmed; checks.smtp is reported as "skipped".
+// Note: SMTP RCPT probing is optional and disabled by default
+// (POSTA_EMAIL_VERIFY_SMTP_ENABLED). When off, mailbox existence is not
+// confirmed and checks.smtp is reported as "skipped". When on, addresses of
+// domains with a conclusive MX are probed and checks.smtp reports the RCPT
+// outcome ("deliverable", "undeliverable", "accept_all" for catch-all
+// domains, or "unknown" when the probe could not determine an answer).
 package verifier
 
 import (
@@ -57,7 +61,7 @@ type Checks struct {
 	MX          bool        `json:"mx"`
 	Disposable  bool        `json:"disposable"`
 	RoleAccount bool        `json:"role_account"`
-	SMTP        SMTPVerdict `json:"smtp"` // always "skipped"; no SMTP probe is performed
+	SMTP        SMTPVerdict `json:"smtp"` // "skipped" unless SMTP probing is enabled; see package doc
 }
 
 // Result is the verification outcome returned to the caller. The intrinsic
@@ -84,6 +88,17 @@ type Options struct {
 	MXTTL       time.Duration
 	RateHourly  int // per-user hourly cap; 0 disables rate limiting
 	Concurrency int // max domains resolved in parallel by VerifyMany; <= 0 uses 16
+
+	// SMTPEnabled turns on the optional SMTP RCPT probe; off by default.
+	SMTPEnabled bool
+	// SMTP configures the prober NewService creates when SMTPEnabled is true.
+	SMTP ProbeOptions
+}
+
+// domainProber is the SMTP-probing surface computeDomain needs; *Prober
+// satisfies it. Kept as an interface so tests can inject a fake.
+type domainProber interface {
+	ProbeDomain(ctx context.Context, domain string, mxHosts, emails []string) (map[string]SMTPVerdict, bool)
 }
 
 // Service verifies email addresses and caches results in Redis.
@@ -92,8 +107,12 @@ type Service struct {
 	suppressions suppressionLookup
 	bounces      bounceLookup
 	opts         Options
-	resolver     Resolver // injectable for tests; nil uses the default
+	resolver     Resolver     // injectable for tests; nil uses the default
+	prober       domainProber // injectable for tests; nil disables SMTP probing regardless of opts
 }
+
+// SetProber swaps the SMTP prober (tests, custom probers).
+func (s *Service) SetProber(p domainProber) { s.prober = p }
 
 // suppressionLookup is the batched suppression check the overlay needs.
 type suppressionLookup interface {
@@ -129,6 +148,9 @@ func NewService(client *redis.Client, suppressionRepo *repositories.SuppressionR
 	}
 	if bounceRepo != nil {
 		s.bounces = bounceRepo
+	}
+	if opts.SMTPEnabled {
+		s.prober = NewProber(opts.SMTP)
 	}
 	return s
 }
@@ -326,15 +348,83 @@ func (s *Service) computeDomain(ctx context.Context, domain string, addrs []stri
 	}
 
 	disposable := isDisposable(domain)
+	var hosts []string
 	outcome, nullMX := dnsOK, false
 	if !disposable {
-		_, outcome, nullMX = s.mxHosts(ctx, domain)
+		hosts, outcome, nullMX = s.mxHosts(ctx, domain)
 	}
+
+	// verdicts is nil when no probe runs at all (SMTP probing disabled, no
+	// prober configured, disposable domain, or an inconclusive MX lookup);
+	// every pending address then keeps SMTPSkipped.
+	verdicts := s.probeVerdicts(ctx, domain, hosts, pending, disposable, outcome)
+
 	for _, e := range pending {
-		out[e] = s.buildResult(e, disposable, outcome, nullMX, SMTPSkipped)
+		smtp := SMTPSkipped
+		if verdicts != nil {
+			if v, ok := verdicts[e]; ok {
+				smtp = v
+			} else {
+				smtp = SMTPUnknown
+			}
+		}
+		out[e] = s.buildResult(e, disposable, outcome, nullMX, smtp)
 		s.setCache(ctx, e, out[e])
 	}
 	return out
+}
+
+// probeChunkSize bounds how many addresses go into a single ProbeDomain call.
+// The Prober caps one session at 3x its Timeout, so a single call for
+// hundreds of same-domain addresses would leave the tail SMTPUnknown.
+const probeChunkSize = 20
+
+// probeVerdicts runs the SMTP probe for pending addresses of domain, or
+// returns nil when no probe should run at all. It consults and populates the
+// per-domain catch-all cache, and chunks pending into groups of at most
+// probeChunkSize addresses per Prober.ProbeDomain call: once one chunk
+// reports catch-all, the remaining pending addresses are marked
+// SMTPAcceptAll without further probing.
+func (s *Service) probeVerdicts(ctx context.Context, domain string, hosts, pending []string, disposable bool, outcome dnsOutcome) map[string]SMTPVerdict {
+	if !s.opts.SMTPEnabled || s.prober == nil || disposable || outcome != dnsOK {
+		return nil
+	}
+
+	key := catchAllKey(domain)
+	if s.client != nil {
+		if v, err := s.client.Get(ctx, key).Result(); err == nil && v == "1" {
+			verdicts := make(map[string]SMTPVerdict, len(pending))
+			for _, e := range pending {
+				verdicts[e] = SMTPAcceptAll
+			}
+			return verdicts
+		}
+	}
+
+	verdicts := make(map[string]SMTPVerdict, len(pending))
+	for start := 0; start < len(pending); start += probeChunkSize {
+		end := start + probeChunkSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		chunk := pending[start:end]
+		res, catchAll := s.prober.ProbeDomain(ctx, domain, hosts, chunk)
+		for _, e := range chunk {
+			if v, ok := res[e]; ok {
+				verdicts[e] = v
+			}
+		}
+		if catchAll {
+			if s.client != nil {
+				s.client.Set(ctx, key, "1", s.opts.MXTTL)
+			}
+			for _, e := range pending[end:] {
+				verdicts[e] = SMTPAcceptAll
+			}
+			break
+		}
+	}
+	return verdicts
 }
 
 // buildResult assembles the intrinsic result for one syntactically valid address.
@@ -540,5 +630,6 @@ func baseResult(email string) *Result {
 	}
 }
 
-func addrKey(email string) string { return "verify:addr:" + email }
-func mxKey(domain string) string  { return "verify:mx:" + strings.ToLower(domain) }
+func addrKey(email string) string      { return "verify:addr:" + email }
+func mxKey(domain string) string       { return "verify:mx:" + strings.ToLower(domain) }
+func catchAllKey(domain string) string { return "verify:catchall:" + strings.ToLower(domain) }
