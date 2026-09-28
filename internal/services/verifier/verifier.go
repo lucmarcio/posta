@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/goposta/posta/internal/storage/repositories"
+	"github.com/jkaninda/logger"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -44,7 +45,8 @@ const (
 	StatusAcceptAll  Status = "accept_all" // domain accepts all addresses (catch-all)
 )
 
-// SMTPVerdict is the outcome of an SMTP RCPT probe (not performed in the MVP).
+// SMTPVerdict is the outcome of the optional SMTP RCPT probe; it is
+// SMTPSkipped when probing is disabled (the default) or not attempted.
 type SMTPVerdict string
 
 const (
@@ -263,14 +265,28 @@ func (s *Service) overlay(scope repositories.ResourceScope, emails []string) (ma
 	if s.suppressions != nil {
 		if m, err := s.suppressions.SuppressedSet(scope, emails); err == nil {
 			sup = m
+		} else {
+			logger.Warn("email verify: suppression lookup failed", "op", "SuppressedSet",
+				"workspace_id", workspaceIDOf(scope), "error", err)
 		}
 	}
 	if s.bounces != nil {
 		if m, err := s.bounces.HardBouncedSet(scope, emails); err == nil {
 			bnc = m
+		} else {
+			logger.Warn("email verify: hard bounce lookup failed", "op", "HardBouncedSet",
+				"workspace_id", workspaceIDOf(scope), "error", err)
 		}
 	}
 	return sup, bnc
+}
+
+// workspaceIDOf returns the scope's workspace id for logging (0 when unset).
+func workspaceIDOf(scope repositories.ResourceScope) uint {
+	if scope.WorkspaceID == nil {
+		return 0
+	}
+	return *scope.WorkspaceID
 }
 
 // computeMany resolves intrinsic results, grouping by domain so each domain's
@@ -590,6 +606,8 @@ func (s *Service) checkRate(ctx context.Context, userID uint, n int) error {
 		s.client.Expire(ctx, key, time.Hour)
 	}
 	if total > int64(s.opts.RateHourly) {
+		// A rejected batch must not consume quota: give the units back.
+		s.client.DecrBy(ctx, key, int64(n))
 		return ErrRateLimited
 	}
 	return nil
