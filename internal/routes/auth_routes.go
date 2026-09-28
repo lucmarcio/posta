@@ -205,6 +205,23 @@ func (r *Router) apiAuthRoutes() []okapi.RouteDefinition {
 		},
 		{
 			Method:      http.MethodPost,
+			Path:        "/emails/verify/batch",
+			Handler:     okapi.H(r.h.verify.VerifyBatch),
+			Group:       apiAuth,
+			Summary:     "Verify a batch of email addresses",
+			Description: "Synchronously verify up to 100 email addresses in one request, in input order. Malformed entries are reported as invalid results rather than rejected. Larger lists should use /emails/verify/jobs.",
+			Request:     &handlers.VerifyBatchRequest{},
+			Response:    &dto.Response[handlers.VerifyBatchResponse]{},
+			Options: []okapi.RouteOption{
+				okapi.DocErrorResponse(400, &dto.ErrorResponseBody{}),
+				okapi.DocErrorResponse(401, &dto.ErrorResponseBody{}),
+				okapi.DocErrorResponse(404, &dto.ErrorResponseBody{}),
+				okapi.DocErrorResponse(413, &dto.ErrorResponseBody{}),
+				okapi.DocErrorResponse(429, &dto.ErrorResponseBody{}),
+			},
+		},
+		{
+			Method:      http.MethodPost,
 			Path:        "/emails/send-template",
 			Handler:     okapi.H(r.h.email.SendWithTemplate),
 			Group:       apiAuth,

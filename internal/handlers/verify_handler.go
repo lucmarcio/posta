@@ -5,10 +5,15 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/goposta/posta/internal/services/verifier"
 	"github.com/jkaninda/okapi"
 )
+
+// MaxVerifyBatch caps the synchronous batch endpoint; larger lists go through
+// verification jobs.
+const MaxVerifyBatch = 100
 
 // VerifyHandler exposes the email-verification endpoint.
 type VerifyHandler struct {
@@ -44,4 +49,45 @@ func (h *VerifyHandler) Verify(c *okapi.Context, req *VerifyAddressRequest) erro
 		return c.AbortInternalServerError("failed to verify email")
 	}
 	return ok(c, res)
+}
+
+// VerifyBatchRequest is the body for POST /emails/verify/batch. Malformed
+// entries are reported as invalid results, not rejected outright.
+type VerifyBatchRequest struct {
+	Fresh bool `query:"fresh" doc:"Bypass the cache and re-check every address"`
+	Body  struct {
+		Emails []string `json:"emails" required:"true" doc:"Up to 100 addresses; malformed entries are reported as invalid, not rejected"`
+	} `json:"body"`
+}
+
+// VerifyBatchResponse is the response for POST /emails/verify/batch.
+type VerifyBatchResponse struct {
+	Items   []*verifier.Result      `json:"items"`
+	Summary map[verifier.Status]int `json:"summary"`
+}
+
+// VerifyBatch verifies up to MaxVerifyBatch addresses synchronously, in input order.
+func (h *VerifyHandler) VerifyBatch(c *okapi.Context, req *VerifyBatchRequest) error {
+	if h.svc == nil || !h.svc.Enabled() {
+		return c.AbortNotFound("email verification is disabled")
+	}
+	n := len(req.Body.Emails)
+	if n == 0 {
+		return c.AbortBadRequest("emails must contain at least one address")
+	}
+	if n > MaxVerifyBatch {
+		return c.AbortRequestEntityTooLarge(fmt.Sprintf("at most %d emails per request; use /emails/verify/jobs for larger lists", MaxVerifyBatch))
+	}
+	items, err := h.svc.VerifyMany(c.Request().Context(), getScope(c), req.Body.Emails, req.Fresh)
+	if err != nil {
+		if errors.Is(err, verifier.ErrRateLimited) {
+			return c.AbortTooManyRequests("email verification rate limit exceeded")
+		}
+		return c.AbortInternalServerError("failed to verify emails")
+	}
+	summary := make(map[verifier.Status]int)
+	for _, it := range items {
+		summary[it.Status]++
+	}
+	return ok(c, VerifyBatchResponse{Items: items, Summary: summary})
 }
