@@ -15,6 +15,7 @@ import (
 	"github.com/goposta/posta/internal/models"
 	"github.com/goposta/posta/internal/services/audit"
 	"github.com/goposta/posta/internal/services/auth"
+	"github.com/goposta/posta/internal/services/bounceingest"
 	"github.com/goposta/posta/internal/services/cache"
 	"github.com/goposta/posta/internal/services/email"
 	"github.com/goposta/posta/internal/services/emailverify"
@@ -370,7 +371,9 @@ func InitRoutes(app *okapi.Okapi, db *gorm.DB, redisClient *redis.Client, cfg *c
 	emailService.SetLinkGenerator(trackingService)
 
 	// Bounce webhook
-	r.h.bounceWebhook = handlers.NewBounceWebhookHandler(subscriberRepo, emailRepo, campaignMessageRepo)
+	// bounceIngestor is shared by every bounce webhook (generic and provider-specific).
+	bounceIngestor := bounceingest.New(emailRepo, bounceRepo, suppressionRepo, subscriberRepo, campaignMessageRepo)
+	r.h.bounceWebhook = handlers.NewBounceWebhookHandler(bounceIngestor)
 
 	// Inbound email
 	if cfg.InboundEnabled {

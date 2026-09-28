@@ -5,31 +5,25 @@ package handlers
 
 import (
 	"strings"
-	"time"
 
-	"github.com/goposta/posta/internal/models"
+	"github.com/goposta/posta/internal/services/bounceingest"
 	"github.com/goposta/posta/internal/storage/repositories"
 	"github.com/jkaninda/logger"
 	"github.com/jkaninda/okapi"
 )
 
-// BounceWebhookHandler processes inbound bounce notifications.
-type BounceWebhookHandler struct {
-	subscriberRepo *repositories.SubscriberRepository
-	emailRepo      *repositories.EmailRepository
-	messageRepo    *repositories.CampaignMessageRepository
+// BounceRecorder is the subset of bounceingest.Ingestor the webhook handlers use.
+type BounceRecorder interface {
+	Record(scope repositories.ResourceScope, ev bounceingest.Event) bounceingest.Outcome
 }
 
-func NewBounceWebhookHandler(
-	subscriberRepo *repositories.SubscriberRepository,
-	emailRepo *repositories.EmailRepository,
-	messageRepo *repositories.CampaignMessageRepository,
-) *BounceWebhookHandler {
-	return &BounceWebhookHandler{
-		subscriberRepo: subscriberRepo,
-		emailRepo:      emailRepo,
-		messageRepo:    messageRepo,
-	}
+// BounceWebhookHandler processes inbound bounce notifications.
+type BounceWebhookHandler struct {
+	recorder BounceRecorder
+}
+
+func NewBounceWebhookHandler(recorder BounceRecorder) *BounceWebhookHandler {
+	return &BounceWebhookHandler{recorder: recorder}
 }
 
 type BounceNotification struct {
@@ -47,47 +41,26 @@ type BounceResponse struct {
 }
 
 func (h *BounceWebhookHandler) HandleBounce(c *okapi.Context, req *BounceNotification) error {
-	email := strings.ToLower(strings.TrimSpace(req.Body.Email))
-	if email == "" {
+	if strings.TrimSpace(req.Body.Email) == "" {
 		return c.AbortBadRequest("email is required")
 	}
-
-	bounceType := req.Body.Type
-	if bounceType == "" {
-		bounceType = "hard"
+	kind := bounceingest.KindHard
+	if req.Body.Type == "soft" {
+		kind = bounceingest.KindSoft
 	}
+	out := h.recorder.Record(getScope(c), bounceingest.Event{
+		Email: req.Body.Email, Kind: kind, Reason: req.Body.Reason,
+		EmailUUID: req.Body.EmailUUID, Source: "webhook",
+	})
 
+	// Keep the legacy action vocabulary: consumers already switch on it.
 	action := "recorded"
-
-	// Mark subscriber as bounced for hard bounces
-	if bounceType == "hard" {
-		// Find all subscribers with this email (across all scopes)
-		var subscribers []models.Subscriber
-		if err := h.subscriberRepo.FindAllByEmail(email, &subscribers); err == nil {
-			now := time.Now()
-			for i := range subscribers {
-				if subscribers[i].Status != models.SubscriberStatusBounced {
-					subscribers[i].Status = models.SubscriberStatusBounced
-					subscribers[i].UpdatedAt = &now
-					_ = h.subscriberRepo.Update(&subscribers[i])
-				}
-			}
-			action = "subscriber_bounced"
-		}
+	switch {
+	case out.MessageMarked:
+		action = "message_bounced"
+	case out.SubscriberUpdated:
+		action = "subscriber_bounced"
 	}
-
-	// Update campaign message if email UUID is provided
-	if req.Body.EmailUUID != "" {
-		em, err := h.emailRepo.FindByUUID(req.Body.EmailUUID)
-		if err == nil {
-			msg, err := h.messageRepo.FindByEmailID(em.ID)
-			if err == nil {
-				_ = h.messageRepo.UpdateBouncedAt(msg.ID)
-				action = "message_bounced"
-			}
-		}
-	}
-
-	logger.Info("bounce processed", "email", email, "type", bounceType, "action", action)
+	logger.Info("bounce processed", "email", out.Email, "type", kind, "action", action)
 	return ok(c, BounceResponse{Processed: true, Action: action})
 }
