@@ -26,7 +26,15 @@ type VerifyJobHandler struct {
 	jobs         *repositories.EmailVerifyJobRepository
 	verifier     *verifier.Service
 	suppressions *repositories.SuppressionRepository
+
+	// afterStart, when set, runs right after the job is marked running. It is
+	// a test seam (e.g. to inject a panic) and is nil in production.
+	afterStart func()
 }
+
+// lastAttempt reports whether the running task will not be retried; tests
+// replace it because asynq's retry metadata cannot be set from outside.
+var lastAttempt = isLastAttempt
 
 func NewVerifyJobHandler(jobs *repositories.EmailVerifyJobRepository, v *verifier.Service, sup *repositories.SuppressionRepository) *VerifyJobHandler {
 	return &VerifyJobHandler{jobs: jobs, verifier: v, suppressions: sup}
@@ -50,14 +58,27 @@ func (h *VerifyJobHandler) ProcessTask(ctx context.Context, t *asynq.Task) (err 
 		return nil
 	}
 	defer func() {
-		if err != nil && isLastAttempt(ctx) {
+		// A panic must not leave the job running forever: on the last attempt
+		// it is marked failed like any error, then re-raised so asynq still
+		// records it.
+		rec := recover()
+		if rec != nil {
+			err = fmt.Errorf("verify job %s: panic: %v", job.UUID, rec)
+		}
+		if err != nil && lastAttempt(ctx) {
 			if mErr := h.jobs.MarkFailed(job.ID, err.Error()); mErr != nil {
 				logger.Error("verify job: cannot mark failed", "job", job.UUID, "error", mErr)
 			}
 		}
+		if rec != nil {
+			panic(rec)
+		}
 	}()
 	if err := h.jobs.MarkRunning(job.ID); err != nil {
 		return err
+	}
+	if h.afterStart != nil {
+		h.afterStart()
 	}
 	scope := repositories.ResourceScope{UserID: job.UserID, WorkspaceID: job.WorkspaceID}
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/goposta/posta/internal/models"
@@ -151,5 +152,43 @@ func TestVerifyJobLoadErrorIsRetried(t *testing.T) {
 	err := h.ProcessTask(context.Background(), asynq.NewTask(TypeVerifyJob, payload))
 	if err == nil || errors.Is(err, asynq.SkipRetry) {
 		t.Fatalf("a load error must be retried, got %v", err)
+	}
+}
+
+func TestVerifyJobPanicOnLastAttemptMarksFailed(t *testing.T) {
+	db := verifyTestDB(t)
+	tx := db.Begin()
+	defer tx.Rollback()
+
+	u := &models.User{Name: "t", Email: "verifyjob-panic@example.com", PasswordHash: "x"}
+	if err := tx.Create(u).Error; err != nil {
+		t.Fatal(err)
+	}
+	ws := uint(8803)
+	jobs := repositories.NewEmailVerifyJobRepository(tx)
+	job := &models.EmailVerifyJob{UserID: u.ID, WorkspaceID: &ws, Source: "emails"}
+	if err := jobs.CreateWithItems(job, []string{"a@good.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := lastAttempt
+	lastAttempt = func(context.Context) bool { return true }
+	t.Cleanup(func() { lastAttempt = prev })
+
+	h := NewVerifyJobHandler(jobs, nil, nil)
+	h.afterStart = func() { panic("boom") }
+	payload, _ := json.Marshal(VerifyJobPayload{JobID: job.ID})
+	func() {
+		defer func() {
+			if r := recover(); r != "boom" {
+				t.Fatalf("the panic must be re-raised, got %v", r)
+			}
+		}()
+		_ = h.ProcessTask(context.Background(), asynq.NewTask(TypeVerifyJob, payload))
+	}()
+
+	got, _ := jobs.FindByID(job.ID)
+	if got.Status != models.EmailVerifyJobFailed || !strings.Contains(got.Error, "panic: boom") {
+		t.Fatalf("a panic on the last attempt must mark the job failed: %+v", got)
 	}
 }

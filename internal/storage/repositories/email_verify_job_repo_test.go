@@ -5,6 +5,7 @@ package repositories
 
 import (
 	"testing"
+	"time"
 
 	"github.com/goposta/posta/internal/models"
 )
@@ -149,5 +150,29 @@ func TestVerifyJobQueriesAndTransitions(t *testing.T) {
 	got, _ = repo.FindByID(job.ID)
 	if got.Status != models.EmailVerifyJobFailed || got.Error != "boom" {
 		t.Fatalf("after MarkFailed: %+v", got)
+	}
+}
+
+func TestVerifyJobCountActiveIgnoresStaleJobs(t *testing.T) {
+	repo := verifyJobDB(t)
+	ws := uint(7021)
+	scope := ResourceScope{UserID: 1, WorkspaceID: &ws}
+	job := &models.EmailVerifyJob{UserID: 1, WorkspaceID: &ws, Source: "emails"}
+	if err := repo.CreateWithItems(job, []string{"a@x.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkRunning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := repo.CountActive(scope); err != nil || n != 1 {
+		t.Fatalf("CountActive fresh = %d, %v", n, err)
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := repo.db.Model(&models.EmailVerifyJob{}).Where("id = ?", job.ID).
+		UpdateColumn("created_at", old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n, err := repo.CountActive(scope); err != nil || n != 0 {
+		t.Fatalf("a running job older than 24h must not count as active: %d, %v", n, err)
 	}
 }

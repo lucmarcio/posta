@@ -72,11 +72,19 @@ func (r *EmailVerifyJobRepository) FindByIdempotencyKey(scope ResourceScope, key
 	return &job, nil
 }
 
-// CountActive counts the scope's jobs that are queued or running.
+// activeJobMaxAge bounds how long a queued or running job counts as active.
+// It exceeds the task timeout (2h) times the retries plus the retry backoff, so
+// a job older than this was abandoned (worker crash, lost task) and must not
+// block new jobs forever.
+const activeJobMaxAge = 24 * time.Hour
+
+// CountActive counts the scope's jobs that are queued or running, ignoring
+// jobs older than activeJobMaxAge.
 func (r *EmailVerifyJobRepository) CountActive(scope ResourceScope) (int64, error) {
 	var n int64
 	err := ApplyScope(r.db.Model(&models.EmailVerifyJob{}), scope).
 		Where("status IN ?", []models.EmailVerifyJobStatus{models.EmailVerifyJobQueued, models.EmailVerifyJobRunning}).
+		Where("created_at > ?", time.Now().Add(-activeJobMaxAge)).
 		Count(&n).Error
 	return n, err
 }
