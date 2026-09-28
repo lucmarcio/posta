@@ -8,9 +8,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/emersion/go-smtp"
@@ -42,6 +45,43 @@ type ProbeOptions struct {
 type Prober struct {
 	opts ProbeOptions
 	sems sync.Map // host -> chan struct{} (capacity PerHost)
+	// allowPrivate lets tests dial loopback servers. Production Probers
+	// leave it false so an MX record can never point the prober at an
+	// internal host.
+	allowPrivate bool
+}
+
+// cgnat is the shared address space of RFC 6598, which net/netip does not
+// classify as private.
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// errForbiddenAddr is returned by the dialer for internal destinations.
+var errForbiddenAddr = errors.New("smtp probe: destination address not allowed")
+
+// isForbiddenAddr reports whether ip is an internal destination the prober
+// must never dial: loopback, private (RFC 1918, fc00::/7), link-local,
+// unspecified, multicast or CGNAT.
+func isForbiddenAddr(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() || cgnat.Contains(ip)
+}
+
+// dialControl rejects internal destinations after name resolution, so the
+// check covers every address the dialer actually connects to.
+func (p *Prober) dialControl(_, address string, _ syscall.RawConn) error {
+	if p.allowPrivate {
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("%w: %s", errForbiddenAddr, address)
+	}
+	if isForbiddenAddr(ap.Addr()) {
+		return fmt.Errorf("%w: %s", errForbiddenAddr, address)
+	}
+	return nil
 }
 
 // NewProber returns a Prober with defaults applied to unset options.
@@ -113,7 +153,7 @@ func (p *Prober) probeHost(ctx context.Context, host, domain string, emails []st
 	}
 	defer func() { <-sem }() // released after the connection is closed below
 
-	d := &net.Dialer{Timeout: p.opts.Timeout}
+	d := &net.Dialer{Timeout: p.opts.Timeout, Control: p.dialControl}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, p.opts.Port))
 	if err != nil {
 		return nil, false, false
@@ -188,8 +228,9 @@ func (p *Prober) probeHost(ctx context.Context, host, domain string, emails []st
 //     except 5.1.7/5.1.8 (bad sender, reported at RCPT with delayed reject),
 //     which are Unknown; any other class/subject (5.7.x policy, 5.2.x
 //     mailbox full, ...) is Unknown whatever the basic code says.
-//  4. Only without an enhanced code does the basic code decide: 550, 551
-//     and 553 are Undeliverable, everything else is Unknown.
+//  4. Without an enhanced code the reply is Unknown, even for 550, 551 or
+//     553: a bare basic code does not say whether the mailbox is missing or
+//     the message was refused for policy reasons.
 func classifyRcpt(err error) SMTPVerdict {
 	if err == nil {
 		return SMTPDeliverable
@@ -202,14 +243,7 @@ func classifyRcpt(err error) SMTPVerdict {
 		return SMTPUnknown
 	}
 	// go-smtp leaves EnhancedCode all zeros when the reply carried none.
-	if ec := se.EnhancedCode; ec[0] > 0 {
-		if ec[0] == 5 && ec[1] == 1 && ec[2] != 7 && ec[2] != 8 {
-			return SMTPUndeliverable
-		}
-		return SMTPUnknown
-	}
-	switch se.Code {
-	case 550, 551, 553:
+	if ec := se.EnhancedCode; ec[0] == 5 && ec[1] == 1 && ec[2] != 7 && ec[2] != 8 {
 		return SMTPUndeliverable
 	}
 	return SMTPUnknown

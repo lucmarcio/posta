@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -93,8 +94,42 @@ func startProbeServer(t *testing.T, be *probeBackend) string {
 }
 
 func testProber(port string) *Prober {
-	return NewProber(ProbeOptions{HeloName: "verify.test", MailFrom: "probe@verify.test",
+	p := NewProber(ProbeOptions{HeloName: "verify.test", MailFrom: "probe@verify.test",
 		Timeout: 3 * time.Second, PerHost: 2, MaxRcptPerSession: 2, Port: port})
+	p.allowPrivate = true // the fake server listens on loopback
+	return p
+}
+
+func TestProbeRefusesInternalHosts(t *testing.T) {
+	be := &probeBackend{known: map[string]bool{"a@d.test": true}}
+	port := startProbeServer(t, be)
+	p := NewProber(ProbeOptions{HeloName: "verify.test", MailFrom: "probe@verify.test",
+		Timeout: 3 * time.Second, Port: port})
+	got, _ := p.ProbeDomain(context.Background(), "d.test", []string{"127.0.0.1"}, []string{"a@d.test"})
+	if got["a@d.test"] != SMTPUnknown {
+		t.Fatalf("got %v", got)
+	}
+	time.Sleep(50 * time.Millisecond) // let a (wrongly) accepted connection reach the backend
+	be.mu.Lock()
+	defer be.mu.Unlock()
+	if be.sessionOpen != 0 {
+		t.Fatalf("the prober connected to a loopback host (%d sessions)", be.sessionOpen)
+	}
+}
+
+func TestIsForbiddenAddr(t *testing.T) {
+	for _, s := range []string{"127.0.0.1", "::1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "fc00::1", "fd12::1",
+		"169.254.169.254", "fe80::1", "0.0.0.0", "::", "224.0.0.1", "ff02::1", "100.64.0.1", "100.127.255.254",
+		"::ffff:10.0.0.1"} {
+		if !isForbiddenAddr(netip.MustParseAddr(s)) {
+			t.Errorf("%s must be forbidden", s)
+		}
+	}
+	for _, s := range []string{"8.8.8.8", "100.128.0.1", "2001:4860:4860::8888", "172.32.0.1"} {
+		if isForbiddenAddr(netip.MustParseAddr(s)) {
+			t.Errorf("%s must be allowed", s)
+		}
+	}
 }
 
 func TestProbeDeliverableAndUndeliverable(t *testing.T) {
@@ -233,9 +268,10 @@ func TestClassifyRcpt(t *testing.T) {
 		{nil, SMTPDeliverable},
 		{e(550, 5, 1, 1), SMTPUndeliverable},
 		{e(553, 5, 1, 3), SMTPUndeliverable},
-		{e(551, 0, 0, 0), SMTPUndeliverable},
-		{&smtp.SMTPError{Code: 550}, SMTPUndeliverable}, // no enhanced code: basic code decides
-		{e(550, 5, 7, 1), SMTPUnknown},                  // policy block, not a missing mailbox
+		{e(551, 0, 0, 0), SMTPUnknown},            // no enhanced code: not proof of a missing mailbox
+		{&smtp.SMTPError{Code: 550}, SMTPUnknown}, // no enhanced code: not proof of a missing mailbox
+		{&smtp.SMTPError{Code: 553}, SMTPUnknown},
+		{e(550, 5, 7, 1), SMTPUnknown}, // policy block, not a missing mailbox
 		{e(553, 5, 7, 1), SMTPUnknown},
 		{e(550, 5, 1, 8), SMTPUnknown}, // bad sender domain reported at RCPT
 		{e(550, 5, 1, 7), SMTPUnknown}, // bad sender mailbox syntax
