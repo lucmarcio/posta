@@ -9,24 +9,32 @@ import (
 )
 
 func TestDecide(t *testing.T) {
+	ok := verdictInput{SyntaxOK: true, DNS: dnsOK, SMTP: SMTPSkipped}
+	with := func(f func(*verdictInput)) verdictInput { v := ok; f(&v); return v }
 	cases := []struct {
-		name                              string
-		syntaxOK, disposable, role, hasMX bool
-		wantStatus                        Status
-		wantScore                         int
+		name       string
+		in         verdictInput
+		wantStatus Status
+		wantScore  int
 	}{
-		{"bad syntax", false, false, false, false, StatusInvalid, 0},
-		{"disposable beats everything else", true, true, true, true, StatusDisposable, 10},
-		{"no mx", true, false, false, false, StatusInvalid, 0},
-		{"role account with mx", true, false, true, true, StatusRisky, 60},
-		{"clean valid", true, false, false, true, StatusValid, 90},
-		{"disposable even without mx", true, true, false, false, StatusDisposable, 10},
+		{"bad syntax", verdictInput{}, StatusInvalid, 0},
+		{"disposable beats everything", with(func(v *verdictInput) { v.Disposable = true; v.Role = true }), StatusDisposable, 10},
+		{"no mail", with(func(v *verdictInput) { v.DNS = dnsNoMail }), StatusInvalid, 0},
+		{"null mx", with(func(v *verdictInput) { v.DNS = dnsNoMail; v.NullMX = true }), StatusInvalid, 0},
+		{"dns temp error", with(func(v *verdictInput) { v.DNS = dnsTempErr }), StatusUnknown, 40},
+		{"smtp undeliverable", with(func(v *verdictInput) { v.SMTP = SMTPUndeliverable }), StatusInvalid, 0},
+		{"role beats deliverable", with(func(v *verdictInput) { v.Role = true; v.SMTP = SMTPDeliverable }), StatusRisky, 60},
+		{"accept all", with(func(v *verdictInput) { v.SMTP = SMTPAcceptAll }), StatusAcceptAll, 50},
+		{"smtp deliverable", with(func(v *verdictInput) { v.SMTP = SMTPDeliverable }), StatusValid, 95},
+		{"smtp unknown keeps dns verdict", with(func(v *verdictInput) { v.SMTP = SMTPUnknown }), StatusValid, 90},
+		{"role without smtp", with(func(v *verdictInput) { v.Role = true }), StatusRisky, 60},
+		{"clean", ok, StatusValid, 90},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			status, score, _ := decide(c.syntaxOK, c.disposable, c.role, c.hasMX)
-			if status != c.wantStatus || score != c.wantScore {
-				t.Fatalf("decide() = (%s, %d), want (%s, %d)", status, score, c.wantStatus, c.wantScore)
+			s, score, _ := decide(c.in)
+			if s != c.wantStatus || score != c.wantScore {
+				t.Fatalf("decide() = (%s, %d), want (%s, %d)", s, score, c.wantStatus, c.wantScore)
 			}
 		})
 	}

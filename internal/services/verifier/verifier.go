@@ -36,15 +36,27 @@ const (
 	StatusRisky      Status = "risky"      // deliverable but discouraged (role account)
 	StatusDisposable Status = "disposable" // throwaway provider
 	StatusUnknown    Status = "unknown"    // could not determine (e.g. DNS error)
+	StatusAcceptAll  Status = "accept_all" // domain accepts all addresses (catch-all)
+)
+
+// SMTPVerdict is the outcome of an SMTP RCPT probe (not performed in the MVP).
+type SMTPVerdict string
+
+const (
+	SMTPSkipped       SMTPVerdict = "skipped"
+	SMTPDeliverable   SMTPVerdict = "deliverable"
+	SMTPUndeliverable SMTPVerdict = "undeliverable"
+	SMTPAcceptAll     SMTPVerdict = "accept_all"
+	SMTPUnknown       SMTPVerdict = "unknown"
 )
 
 // Checks records which individual checks passed.
 type Checks struct {
-	Syntax      bool   `json:"syntax"`
-	MX          bool   `json:"mx"`
-	Disposable  bool   `json:"disposable"`
-	RoleAccount bool   `json:"role_account"`
-	SMTP        string `json:"smtp"` // always "skipped"; no SMTP probe is performed
+	Syntax      bool        `json:"syntax"`
+	MX          bool        `json:"mx"`
+	Disposable  bool        `json:"disposable"`
+	RoleAccount bool        `json:"role_account"`
+	SMTP        SMTPVerdict `json:"smtp"` // always "skipped"; no SMTP probe is performed
 }
 
 // Result is the verification outcome returned to the caller. The intrinsic
@@ -52,7 +64,7 @@ type Checks struct {
 // cached in Redis; the per-tenant flags are layered on per request.
 type Result struct {
 	Email             string    `json:"email"`
-	Status            Status    `json:"status" enum:"valid,invalid,risky,disposable,unknown"`
+	Status            Status    `json:"status" enum:"valid,invalid,risky,accept_all,disposable,unknown"`
 	Score             int       `json:"score"`
 	Checks            Checks    `json:"checks"`
 	Reason            string    `json:"reason,omitempty"`
@@ -77,8 +89,17 @@ type Service struct {
 	suppressionRepo *repositories.SuppressionRepository
 	bounceRepo      *repositories.BounceRepository
 	opts            Options
-	resolver        *net.Resolver // injectable for tests; nil uses the default
+	resolver        Resolver // injectable for tests; nil uses the default
 }
+
+// Resolver is the DNS surface the verifier needs; *net.Resolver satisfies it.
+type Resolver interface {
+	LookupMX(ctx context.Context, name string) ([]*net.MX, error)
+	LookupHost(ctx context.Context, host string) ([]string, error)
+}
+
+// SetResolver swaps the DNS resolver (tests, custom resolvers).
+func (s *Service) SetResolver(r Resolver) { s.resolver = r }
 
 // NewService builds a verifier. suppressionRepo/bounceRepo may be nil (the
 // per-tenant overlay is then skipped); client must be non-nil for caching.
@@ -169,31 +190,62 @@ func (s *Service) compute(ctx context.Context, email string) *Result {
 
 	// Disposable domains are disqualified without a DNS lookup.
 	if disposable {
-		r.Status, r.Score, r.Reason = decide(true, true, role, false)
+		r.Status, r.Score, r.Reason = decide(verdictInput{SyntaxOK: true, Disposable: true, Role: role, DNS: dnsOK, SMTP: SMTPSkipped})
 		return r
 	}
 
-	hosts := s.mxHosts(ctx, domain)
-	r.Checks.MX = len(hosts) > 0
-	r.Status, r.Score, r.Reason = decide(true, false, role, len(hosts) > 0)
+	_, outcome, nullMX := s.mxHosts(ctx, domain)
+	r.Checks.MX = !disposable && outcome == dnsOK
+	r.Status, r.Score, r.Reason = decide(verdictInput{SyntaxOK: true, Disposable: disposable, Role: role, DNS: outcome, NullMX: nullMX, SMTP: SMTPSkipped})
 	return r
 }
 
+// dnsOutcome is the conclusiveness of a domain's mail-acceptance lookup.
+type dnsOutcome int
+
+const (
+	dnsOK      dnsOutcome = iota // domain can receive mail
+	dnsNoMail                    // NXDOMAIN, no MX/A, or null MX: conclusively cannot
+	dnsTempErr                   // timeout/SERVFAIL: undetermined, never cached
+)
+
+// verdictInput is the pure input to decide, gathering every signal that
+// contributes to the final verdict.
+type verdictInput struct {
+	SyntaxOK, Disposable, Role bool
+	DNS                        dnsOutcome
+	NullMX                     bool
+	SMTP                       SMTPVerdict
+}
+
 // decide encodes the verdict precedence as a pure function so it is easy to test.
-func decide(syntaxOK, disposable, roleAccount, hasMX bool) (Status, int, string) {
+func decide(in verdictInput) (Status, int, string) {
 	switch {
-	case !syntaxOK:
+	case !in.SyntaxOK:
 		return StatusInvalid, 0, "invalid syntax"
-	case disposable:
+	case in.Disposable:
 		return StatusDisposable, 10, "disposable email provider"
-	case !hasMX:
+	case in.DNS == dnsTempErr:
+		return StatusUnknown, 40, "DNS lookup failed temporarily"
+	case in.DNS == dnsNoMail && in.NullMX:
+		return StatusInvalid, 0, "domain does not accept mail (null MX)"
+	case in.DNS == dnsNoMail:
 		return StatusInvalid, 0, "domain has no mail exchanger (MX/A) records"
-	case roleAccount:
+	case in.SMTP == SMTPUndeliverable:
+		return StatusInvalid, 0, "mailbox does not exist"
+	case in.Role:
 		return StatusRisky, 60, "role-based address"
+	case in.SMTP == SMTPAcceptAll:
+		return StatusAcceptAll, 50, "domain accepts all addresses (catch-all)"
+	case in.SMTP == SMTPDeliverable:
+		return StatusValid, 95, ""
 	default:
 		return StatusValid, 90, ""
 	}
 }
+
+// shouldCache keeps undetermined results out of the address cache.
+func shouldCache(r *Result) bool { return r.Status != StatusUnknown }
 
 // tenantOverlay returns the current tenant's suppression/bounce status.
 func (s *Service) tenantOverlay(scope repositories.ResourceScope, email string) (suppressed, bounced bool) {
@@ -210,34 +262,41 @@ func (s *Service) tenantOverlay(scope repositories.ResourceScope, email string) 
 	return suppressed, bounced
 }
 
-// mxHosts returns the domain's mail exchangers (or the domain itself when only
-// an A/AAAA record exists — an implicit MX per RFC 5321 §5.1), caching the
-// answer per domain in Redis. An empty slice means the domain cannot receive
-// mail. The cached sentinel "none" distinguishes a negative result from a miss.
-func (s *Service) mxHosts(ctx context.Context, domain string) []string {
+const nullMXSentinel = "nullmx"
+
+// mxHosts returns the domain's mail hosts and the DNS outcome, caching only
+// conclusive answers ("none"/"nullmx" sentinels for negatives).
+func (s *Service) mxHosts(ctx context.Context, domain string) ([]string, dnsOutcome, bool) {
 	key := mxKey(domain)
 	if s.client != nil {
 		if v, err := s.client.Get(ctx, key).Result(); err == nil {
-			if v == "" || v == "none" {
-				return nil
+			switch v {
+			case "", "none":
+				return nil, dnsNoMail, false
+			case nullMXSentinel:
+				return nil, dnsNoMail, true
+			default:
+				return strings.Split(v, ","), dnsOK, false
 			}
-			return strings.Split(v, ",")
 		}
 	}
 
-	hosts := s.lookupMX(ctx, domain)
+	hosts, outcome, nullMX := s.lookupMX(ctx, domain)
 
-	if s.client != nil {
-		val := "none"
-		if len(hosts) > 0 {
-			val = strings.Join(hosts, ",")
+	if s.client != nil && outcome != dnsTempErr {
+		val := strings.Join(hosts, ",")
+		if outcome == dnsNoMail {
+			val = "none"
+			if nullMX {
+				val = nullMXSentinel
+			}
 		}
 		s.client.Set(ctx, key, val, s.opts.MXTTL)
 	}
-	return hosts
+	return hosts, outcome, nullMX
 }
 
-func (s *Service) lookupMX(ctx context.Context, domain string) []string {
+func (s *Service) lookupMX(ctx context.Context, domain string) ([]string, dnsOutcome, bool) {
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -246,18 +305,36 @@ func (s *Service) lookupMX(ctx context.Context, domain string) []string {
 		resolver = net.DefaultResolver
 	}
 
-	if mxs, err := resolver.LookupMX(lookupCtx, domain); err == nil && len(mxs) > 0 {
+	mxs, err := resolver.LookupMX(lookupCtx, domain)
+	switch {
+	case err == nil && len(mxs) > 0:
+		// RFC 7505: a single "." exchanger means the domain accepts no mail.
+		if len(mxs) == 1 && strings.TrimSuffix(mxs[0].Host, ".") == "" {
+			return nil, dnsNoMail, true
+		}
 		hosts := make([]string, 0, len(mxs))
 		for _, mx := range mxs {
 			hosts = append(hosts, mx.Host)
 		}
-		return hosts
+		return hosts, dnsOK, false
+	case err != nil && !isNotFound(err):
+		return nil, dnsTempErr, false
 	}
-	// Fallback: a domain with an A/AAAA record can still receive mail.
-	if addrs, err := resolver.LookupHost(lookupCtx, domain); err == nil && len(addrs) > 0 {
-		return []string{domain}
+
+	// No MX: a domain with an A/AAAA record still receives mail (RFC 5321 §5.1).
+	addrs, err := resolver.LookupHost(lookupCtx, domain)
+	switch {
+	case err == nil && len(addrs) > 0:
+		return []string{domain}, dnsOK, false
+	case err != nil && !isNotFound(err):
+		return nil, dnsTempErr, false
 	}
-	return nil
+	return nil, dnsNoMail, false
+}
+
+func isNotFound(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
 
 // checkRate increments a per-user hourly counter; fails open on Redis errors.
@@ -295,7 +372,7 @@ func (s *Service) getCache(ctx context.Context, email string) *Result {
 }
 
 func (s *Service) setCache(ctx context.Context, email string, r *Result) {
-	if s.client == nil {
+	if s.client == nil || !shouldCache(r) {
 		return
 	}
 	b, err := json.Marshal(r)
@@ -309,7 +386,7 @@ func baseResult(email string) *Result {
 	return &Result{
 		Email:     email,
 		Status:    StatusUnknown,
-		Checks:    Checks{SMTP: "skipped"},
+		Checks:    Checks{SMTP: SMTPSkipped},
 		CheckedAt: time.Now().UTC(),
 	}
 }
