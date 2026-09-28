@@ -83,6 +83,32 @@ func (r *BounceRepository) CountHardBouncesByRecipient(userID uint, recipient st
 	return count, err
 }
 
+// HardBouncedSet returns which of emails hard-bounced in scope, keyed by
+// normalized address. Queried in chunks to stay under the bind-param limit.
+func (r *BounceRepository) HardBouncedSet(scope ResourceScope, emails []string) (map[string]struct{}, error) {
+	out := make(map[string]struct{})
+	norm := make([]string, 0, len(emails))
+	for _, e := range emails {
+		if n := normalizeEmail(e); n != "" {
+			norm = append(norm, n)
+		}
+	}
+	for start := 0; start < len(norm); start += suppressionLookupChunk {
+		end := min(start+suppressionLookupChunk, len(norm))
+		var hits []string
+		if err := ApplyScope(r.db.Model(&models.Bounce{}), scope).
+			Where("type = ?", models.BounceTypeHard).
+			Where("LOWER(recipient) IN ?", norm[start:end]).
+			Distinct().Pluck("LOWER(recipient)", &hits).Error; err != nil {
+			return nil, err
+		}
+		for _, h := range hits {
+			out[h] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
 // CountByUserAndDateRange counts bounces for a user within a date range.
 func (r *BounceRepository) CountByUserAndDateRange(userID uint, from, to time.Time) (int64, error) {
 	var count int64

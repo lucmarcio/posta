@@ -18,13 +18,14 @@ import (
 	"net"
 	"net/mail"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goposta/posta/internal/storage/repositories"
 	"github.com/redis/go-redis/v9"
 )
 
-// ErrRateLimited is returned by Verify when the per-user hourly limit is hit.
+// ErrRateLimited is returned by Verify/VerifyMany when the per-user hourly limit is hit.
 var ErrRateLimited = errors.New("verification rate limit exceeded")
 
 // Status is the overall verdict for an address.
@@ -78,19 +79,30 @@ type Result struct {
 
 // Options configures a Service. Durations and limits come from app config.
 type Options struct {
-	Enabled    bool
-	AddrTTL    time.Duration
-	MXTTL      time.Duration
-	RateHourly int // per-user hourly cap; 0 disables rate limiting
+	Enabled     bool
+	AddrTTL     time.Duration
+	MXTTL       time.Duration
+	RateHourly  int // per-user hourly cap; 0 disables rate limiting
+	Concurrency int // max domains resolved in parallel by VerifyMany; <= 0 uses 16
 }
 
 // Service verifies email addresses and caches results in Redis.
 type Service struct {
-	client          *redis.Client
-	suppressionRepo *repositories.SuppressionRepository
-	bounceRepo      *repositories.BounceRepository
-	opts            Options
-	resolver        Resolver // injectable for tests; nil uses the default
+	client       *redis.Client
+	suppressions suppressionLookup
+	bounces      bounceLookup
+	opts         Options
+	resolver     Resolver // injectable for tests; nil uses the default
+}
+
+// suppressionLookup is the batched suppression check the overlay needs.
+type suppressionLookup interface {
+	SuppressedSet(scope repositories.ResourceScope, emails []string) (map[string]struct{}, error)
+}
+
+// bounceLookup is the batched hard-bounce check the overlay needs.
+type bounceLookup interface {
+	HardBouncedSet(scope repositories.ResourceScope, emails []string) (map[string]struct{}, error)
 }
 
 // Resolver is the DNS surface the verifier needs; *net.Resolver satisfies it.
@@ -105,104 +117,251 @@ func (s *Service) SetResolver(r Resolver) { s.resolver = r }
 // NewService builds a verifier. suppressionRepo/bounceRepo may be nil (the
 // per-tenant overlay is then skipped); client must be non-nil for caching.
 func NewService(client *redis.Client, suppressionRepo *repositories.SuppressionRepository, bounceRepo *repositories.BounceRepository, opts Options) *Service {
-	return &Service{
-		client:          client,
-		suppressionRepo: suppressionRepo,
-		bounceRepo:      bounceRepo,
-		opts:            opts,
-		resolver:        net.DefaultResolver,
+	s := &Service{
+		client:   client,
+		opts:     opts,
+		resolver: net.DefaultResolver,
 	}
+	// Assign only non-nil pointers: a nil pointer stored in an interface
+	// would make the interface itself non-nil.
+	if suppressionRepo != nil {
+		s.suppressions = suppressionRepo
+	}
+	if bounceRepo != nil {
+		s.bounces = bounceRepo
+	}
+	return s
 }
 
 // Enabled reports whether verification is turned on.
 func (s *Service) Enabled() bool { return s.opts.Enabled }
 
-// Verify checks an address. fresh=true bypasses the Redis cache. The returned
-// Result always reflects the current tenant's suppression/bounce history.
+// Verify checks one address; it is VerifyMany with a single input. fresh=true
+// bypasses the Redis cache. The returned Result always reflects the current
+// tenant's suppression/bounce history.
 func (s *Service) Verify(ctx context.Context, scope repositories.ResourceScope, rawEmail string, fresh bool) (*Result, error) {
-	email := strings.ToLower(strings.TrimSpace(rawEmail))
-
-	// Syntax. A malformed address is conclusively invalid.
-	addr, err := mail.ParseAddress(email)
+	res, err := s.VerifyMany(ctx, scope, []string{rawEmail}, fresh)
 	if err != nil {
-		r := baseResult(email)
-		r.Status = StatusInvalid
-		r.Reason = "invalid syntax"
-		return r, nil
+		return nil, err
 	}
-	email = strings.ToLower(addr.Address)
+	return res[0], nil
+}
 
-	// Per-user rate limit (fail-open on Redis errors).
-	if s.opts.RateHourly > 0 {
-		if err := s.checkRate(ctx, scope.UserID); err != nil {
+// VerifyMany verifies addresses in input order, charging the hourly rate
+// limit once per distinct syntactically valid address.
+func (s *Service) VerifyMany(ctx context.Context, scope repositories.ResourceScope, emails []string, fresh bool) ([]*Result, error) {
+	return s.verifyMany(ctx, scope, emails, fresh, true)
+}
+
+// VerifyManyUnmetered is VerifyMany without the hourly rate limit, for
+// background jobs whose size was already bounded at submission.
+func (s *Service) VerifyManyUnmetered(ctx context.Context, scope repositories.ResourceScope, emails []string, fresh bool) ([]*Result, error) {
+	return s.verifyMany(ctx, scope, emails, fresh, false)
+}
+
+func (s *Service) verifyMany(ctx context.Context, scope repositories.ResourceScope, emails []string, fresh, metered bool) ([]*Result, error) {
+	results := make([]*Result, len(emails))
+	positions := make(map[string][]int) // normalized address -> input indexes
+	var distinct []string
+
+	for i, raw := range emails {
+		email, ok := normalizeAddress(raw)
+		if !ok {
+			r := baseResult(strings.ToLower(strings.TrimSpace(raw)))
+			r.Status, r.Score, r.Reason = decide(verdictInput{})
+			results[i] = r
+			continue
+		}
+		if _, seen := positions[email]; !seen {
+			distinct = append(distinct, email)
+		}
+		positions[email] = append(positions[email], i)
+	}
+	if len(distinct) == 0 {
+		return results, nil
+	}
+
+	if metered && s.opts.RateHourly > 0 {
+		if err := s.checkRate(ctx, scope.UserID, len(distinct)); err != nil {
 			return nil, err
 		}
 	}
 
-	// Per-tenant history overlay (no network). Suppressed or previously
-	//    hard-bounced addresses are conclusively bad for this tenant.
-	suppressed, bounced := s.tenantOverlay(scope, email)
-	if suppressed || bounced {
-		r := baseResult(email)
-		r.Checks.Syntax = true
-		r.Status = StatusInvalid
-		r.Score = 0
-		r.Suppressed = suppressed
-		r.PreviouslyBounced = bounced
-		if suppressed {
-			r.Reason = "address is on the suppression list"
+	suppressed, bounced := s.overlay(scope, distinct)
+
+	var toCompute []string
+	for _, e := range distinct {
+		_, sup := suppressed[e]
+		_, bnc := bounced[e]
+		if !sup && !bnc {
+			toCompute = append(toCompute, e)
+		}
+	}
+	intrinsic := s.computeMany(ctx, toCompute, fresh)
+
+	for _, e := range distinct {
+		_, sup := suppressed[e]
+		_, bnc := bounced[e]
+		var base *Result
+		if sup || bnc {
+			base = baseResult(e)
+			base.Checks.Syntax = true
+			base.Status, base.Score = StatusInvalid, 0
+			base.Suppressed, base.PreviouslyBounced = sup, bnc
+			if sup {
+				base.Reason = "address is on the suppression list"
+			} else {
+				base.Reason = "address previously hard-bounced"
+			}
 		} else {
-			r.Reason = "address previously hard-bounced"
+			base = intrinsic[e]
 		}
-		return r, nil
-	}
-
-	// Redis cache for the intrinsic result.
-	if !fresh {
-		if cached := s.getCache(ctx, email); cached != nil {
-			cached.Cached = true
-			cached.Suppressed = suppressed
-			cached.PreviouslyBounced = bounced
-			return cached, nil
+		for _, idx := range positions[e] {
+			cp := *base
+			results[idx] = &cp
 		}
 	}
-
-	// Compute the intrinsic result (disposable/role/MX) and cache it.
-	r := s.compute(ctx, email)
-	s.setCache(ctx, email, r)
-
-	r.Suppressed = suppressed
-	r.PreviouslyBounced = bounced
-	return r, nil
+	return results, nil
 }
 
-// compute runs the intrinsic checks for a syntactically valid address.
-func (s *Service) compute(ctx context.Context, email string) *Result {
-	r := baseResult(email)
-	r.Checks.Syntax = true
+// normalizeAddress parses raw as an address and returns its lowercased bare
+// form; ok is false when raw is not a syntactically valid address.
+func normalizeAddress(raw string) (string, bool) {
+	addr, err := mail.ParseAddress(strings.TrimSpace(raw))
+	if err != nil || !strings.Contains(addr.Address, "@") {
+		return "", false
+	}
+	return strings.ToLower(addr.Address), true
+}
 
-	at := strings.LastIndex(email, "@")
-	local, domain := email[:at], email[at+1:]
+// overlay loads the tenant's suppression and hard-bounce history in one query
+// each. Lookup errors fail open, as the single-address path always has.
+func (s *Service) overlay(scope repositories.ResourceScope, emails []string) (map[string]struct{}, map[string]struct{}) {
+	sup, bnc := map[string]struct{}{}, map[string]struct{}{}
+	if s.suppressions != nil {
+		if m, err := s.suppressions.SuppressedSet(scope, emails); err == nil {
+			sup = m
+		}
+	}
+	if s.bounces != nil {
+		if m, err := s.bounces.HardBouncedSet(scope, emails); err == nil {
+			bnc = m
+		}
+	}
+	return sup, bnc
+}
 
-	if sug := suggestDomain(domain); sug != "" {
-		r.Suggestion = local + "@" + sug
+// computeMany resolves intrinsic results, grouping by domain so each domain's
+// DNS is looked up once, with at most Concurrency domains in flight.
+func (s *Service) computeMany(ctx context.Context, emails []string, fresh bool) map[string]*Result {
+	out := make(map[string]*Result, len(emails))
+	if len(emails) == 0 {
+		return out
+	}
+	byDomain := make(map[string][]string)
+	var domains []string
+	for _, e := range emails {
+		d := e[strings.LastIndex(e, "@")+1:]
+		if _, ok := byDomain[d]; !ok {
+			domains = append(domains, d)
+		}
+		byDomain[d] = append(byDomain[d], e)
+	}
+
+	workers := s.opts.Concurrency
+	if workers <= 0 {
+		workers = 16
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+	for _, d := range domains {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(domain string, addrs []string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			local := s.computeDomain(ctx, domain, addrs, fresh)
+			mu.Lock()
+			for k, v := range local {
+				out[k] = v
+			}
+			mu.Unlock()
+		}(d, byDomain[d])
+	}
+	wg.Wait()
+
+	// Anything skipped by cancellation is reported as undetermined.
+	for _, e := range emails {
+		if out[e] == nil {
+			r := baseResult(e)
+			r.Checks.Syntax = true
+			r.Status, r.Score, r.Reason = decide(verdictInput{SyntaxOK: true, DNS: dnsTempErr})
+			out[e] = r
+		}
+	}
+	return out
+}
+
+// computeDomain serves cached addresses and computes the rest with a single
+// DNS resolution for the domain.
+func (s *Service) computeDomain(ctx context.Context, domain string, addrs []string, fresh bool) map[string]*Result {
+	out := make(map[string]*Result, len(addrs))
+	var pending []string
+	for _, e := range addrs {
+		if !fresh {
+			if cached := s.getCache(ctx, e); cached != nil {
+				cached.Cached = true
+				out[e] = cached
+				continue
+			}
+		}
+		pending = append(pending, e)
+	}
+	if len(pending) == 0 {
+		return out
 	}
 
 	disposable := isDisposable(domain)
-	role := isRoleAccount(local)
-	r.Checks.Disposable = disposable
-	r.Checks.RoleAccount = role
-
-	// Disposable domains are disqualified without a DNS lookup.
-	if disposable {
-		r.Status, r.Score, r.Reason = decide(verdictInput{SyntaxOK: true, Disposable: true, Role: role, DNS: dnsOK, SMTP: SMTPSkipped})
-		return r
+	outcome, nullMX := dnsOK, false
+	if !disposable {
+		_, outcome, nullMX = s.mxHosts(ctx, domain)
 	}
+	for _, e := range pending {
+		out[e] = s.buildResult(e, disposable, outcome, nullMX, SMTPSkipped)
+		s.setCache(ctx, e, out[e])
+	}
+	return out
+}
 
-	_, outcome, nullMX := s.mxHosts(ctx, domain)
+// buildResult assembles the intrinsic result for one syntactically valid address.
+func (s *Service) buildResult(email string, disposable bool, outcome dnsOutcome, nullMX bool, smtp SMTPVerdict) *Result {
+	at := strings.LastIndex(email, "@")
+	local, domain := email[:at], email[at+1:]
+	r := baseResult(email)
+	r.Checks.Syntax = true
+	r.Checks.Disposable = disposable
+	r.Checks.RoleAccount = isRoleAccount(local)
 	r.Checks.MX = !disposable && outcome == dnsOK
-	r.Status, r.Score, r.Reason = decide(verdictInput{SyntaxOK: true, Disposable: disposable, Role: role, DNS: outcome, NullMX: nullMX, SMTP: SMTPSkipped})
+	r.Checks.SMTP = smtp
+	r.MailboxVerified = smtp == SMTPDeliverable
+	if sug := suggestDomain(domain); sug != "" {
+		r.Suggestion = local + "@" + sug
+	}
+	r.Status, r.Score, r.Reason = decide(verdictInput{
+		SyntaxOK: true, Disposable: disposable, Role: r.Checks.RoleAccount,
+		DNS: outcome, NullMX: nullMX, SMTP: smtp,
+	})
 	return r
+}
+
+// compute runs the intrinsic checks for one syntactically valid address,
+// bypassing the address cache.
+func (s *Service) compute(ctx context.Context, email string) *Result {
+	return s.computeDomain(ctx, email[strings.LastIndex(email, "@")+1:], []string{email}, true)[email]
 }
 
 // dnsOutcome is the conclusiveness of a domain's mail-acceptance lookup.
@@ -251,21 +410,6 @@ func decide(in verdictInput) (Status, int, string) {
 
 // shouldCache keeps undetermined results out of the address cache.
 func shouldCache(r *Result) bool { return r.Status != StatusUnknown }
-
-// tenantOverlay returns the current tenant's suppression/bounce status.
-func (s *Service) tenantOverlay(scope repositories.ResourceScope, email string) (suppressed, bounced bool) {
-	if s.suppressionRepo != nil {
-		if ok, err := s.suppressionRepo.IsSuppressed(scope, email); err == nil {
-			suppressed = ok
-		}
-	}
-	if s.bounceRepo != nil {
-		if n, err := s.bounceRepo.CountHardBouncesByRecipient(scope.UserID, email); err == nil && n > 0 {
-			bounced = true
-		}
-	}
-	return suppressed, bounced
-}
 
 const nullMXSentinel = "nullmx"
 
@@ -342,20 +486,20 @@ func isNotFound(err error) bool {
 	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
 
-// checkRate increments a per-user hourly counter; fails open on Redis errors.
-func (s *Service) checkRate(ctx context.Context, userID uint) error {
-	if s.client == nil {
+// checkRate adds n to a per-user hourly counter; fails open on Redis errors.
+func (s *Service) checkRate(ctx context.Context, userID uint, n int) error {
+	if s.client == nil || n <= 0 {
 		return nil
 	}
 	key := fmt.Sprintf("verify:rl:hour:%d:%s", userID, time.Now().Format("2006010215"))
-	n, err := s.client.Incr(ctx, key).Result()
+	total, err := s.client.IncrBy(ctx, key, int64(n)).Result()
 	if err != nil {
 		return nil
 	}
-	if n == 1 {
+	if total == int64(n) {
 		s.client.Expire(ctx, key, time.Hour)
 	}
-	if n > int64(s.opts.RateHourly) {
+	if total > int64(s.opts.RateHourly) {
 		return ErrRateLimited
 	}
 	return nil

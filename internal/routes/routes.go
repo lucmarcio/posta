@@ -202,10 +202,11 @@ func InitRoutes(app *okapi.Okapi, db *gorm.DB, redisClient *redis.Client, cfg *c
 
 	// Email verification service (Redis-cached)
 	verifierSvc := verifier.NewService(redisClient, suppressionRepo, bounceRepo, verifier.Options{
-		Enabled:    cfg.EmailVerifyEnabled,
-		AddrTTL:    time.Duration(cfg.EmailVerifyCacheTTLHours) * time.Hour,
-		MXTTL:      time.Duration(cfg.EmailVerifyMXCacheTTLHours) * time.Hour,
-		RateHourly: cfg.EmailVerifyRateHourly,
+		Enabled:     cfg.EmailVerifyEnabled,
+		AddrTTL:     time.Duration(cfg.EmailVerifyCacheTTLHours) * time.Hour,
+		MXTTL:       time.Duration(cfg.EmailVerifyMXCacheTTLHours) * time.Hour,
+		RateHourly:  cfg.EmailVerifyRateHourly,
+		Concurrency: cfg.EmailVerifyConcurrency,
 	})
 
 	// Handlers

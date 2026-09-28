@@ -37,6 +37,7 @@ type Config struct {
 	EmailVerifyCacheTTLHours   int
 	EmailVerifyMXCacheTTLHours int
 	EmailVerifyRateHourly      int // per-user hourly cap; 0 disables
+	EmailVerifyConcurrency     int // max domains resolved in parallel per batch
 	AdminEmail                 string
 	AdminPassword              string
 	OpenAPIDocs                bool
@@ -266,6 +267,7 @@ func New() *Config {
 		EmailVerifyCacheTTLHours:   goutils.EnvInt("POSTA_EMAIL_VERIFY_CACHE_TTL_HOURS", 168),
 		EmailVerifyMXCacheTTLHours: goutils.EnvInt("POSTA_EMAIL_VERIFY_MX_CACHE_TTL_HOURS", 24),
 		EmailVerifyRateHourly:      goutils.EnvInt("POSTA_EMAIL_VERIFY_RATE_HOURLY", 1000),
+		EmailVerifyConcurrency:     goutils.EnvInt("POSTA_EMAIL_VERIFY_CONCURRENCY", 16),
 		AdminEmail:                 goutils.Env("POSTA_ADMIN_EMAIL", "admin@example.com"),
 		AdminPassword:              goutils.Env("POSTA_ADMIN_PASSWORD", "admin1234"),
 		OpenAPIDocs:                goutils.EnvBool("POSTA_OPENAPI_DOCS", true),
