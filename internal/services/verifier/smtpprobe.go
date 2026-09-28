@@ -181,8 +181,15 @@ func (p *Prober) probeHost(ctx context.Context, host, domain string, emails []st
 }
 
 // classifyRcpt maps an RCPT TO reply to a verdict. Only replies that clearly
-// say the mailbox does not exist are Undeliverable; policy rejections,
-// temporary failures and network errors are Unknown.
+// say the recipient mailbox does not exist are Undeliverable. Precedence:
+//  1. nil is Deliverable; an error that is not *smtp.SMTPError is Unknown.
+//  2. Undeliverable always requires a permanent (5xx) basic code.
+//  3. When an enhanced code is present it decides: 5.1.x is Undeliverable,
+//     except 5.1.7/5.1.8 (bad sender, reported at RCPT with delayed reject),
+//     which are Unknown; any other class/subject (5.7.x policy, 5.2.x
+//     mailbox full, ...) is Unknown whatever the basic code says.
+//  4. Only without an enhanced code does the basic code decide: 550, 551
+//     and 553 are Undeliverable, everything else is Unknown.
 func classifyRcpt(err error) SMTPVerdict {
 	if err == nil {
 		return SMTPDeliverable
@@ -191,11 +198,18 @@ func classifyRcpt(err error) SMTPVerdict {
 	if !errors.As(err, &se) {
 		return SMTPUnknown
 	}
+	if se.Code/100 != 5 {
+		return SMTPUnknown
+	}
+	// go-smtp leaves EnhancedCode all zeros when the reply carried none.
+	if ec := se.EnhancedCode; ec[0] > 0 {
+		if ec[0] == 5 && ec[1] == 1 && ec[2] != 7 && ec[2] != 8 {
+			return SMTPUndeliverable
+		}
+		return SMTPUnknown
+	}
 	switch se.Code {
 	case 550, 551, 553:
-		return SMTPUndeliverable
-	}
-	if se.EnhancedCode[0] == 5 && se.EnhancedCode[1] == 1 {
 		return SMTPUndeliverable
 	}
 	return SMTPUnknown

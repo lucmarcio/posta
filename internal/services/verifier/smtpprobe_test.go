@@ -234,6 +234,13 @@ func TestClassifyRcpt(t *testing.T) {
 		{e(550, 5, 1, 1), SMTPUndeliverable},
 		{e(553, 5, 1, 3), SMTPUndeliverable},
 		{e(551, 0, 0, 0), SMTPUndeliverable},
+		{&smtp.SMTPError{Code: 550}, SMTPUndeliverable}, // no enhanced code: basic code decides
+		{e(550, 5, 7, 1), SMTPUnknown},                  // policy block, not a missing mailbox
+		{e(553, 5, 7, 1), SMTPUnknown},
+		{e(550, 5, 1, 8), SMTPUnknown}, // bad sender domain reported at RCPT
+		{e(550, 5, 1, 7), SMTPUnknown}, // bad sender mailbox syntax
+		{e(450, 5, 1, 1), SMTPUnknown}, // temporary basic code wins
+		{e(530, 0, 0, 0), SMTPUnknown},
 		{e(501, 5, 1, 3), SMTPUndeliverable},
 		{e(552, 5, 2, 2), SMTPUnknown},
 		{e(554, 5, 7, 1), SMTPUnknown},
