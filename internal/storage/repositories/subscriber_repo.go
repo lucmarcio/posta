@@ -41,11 +41,6 @@ func (r *SubscriberRepository) FindByEmail(scope ResourceScope, email string) (*
 	return &s, nil
 }
 
-// FindAllByEmail finds all subscribers with the given email address across all scopes.
-func (r *SubscriberRepository) FindAllByEmail(email string, result *[]models.Subscriber) error {
-	return r.db.Where("email = ?", strings.ToLower(strings.TrimSpace(email))).Find(result).Error
-}
-
 func (r *SubscriberRepository) FindByScope(scope ResourceScope, search, status string, limit, offset int) ([]models.Subscriber, int64, error) {
 	var items []models.Subscriber
 	var total int64
