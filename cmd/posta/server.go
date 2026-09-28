@@ -461,6 +461,7 @@ func startEmbeddedWorker(db *gorm.DB,
 		campaignProducer,
 		campaignDispatcher,
 	)
+	campaignProcessor.SetSuppressionRepo(repositories.NewSuppressionRepository(db))
 
 	// Daily report handler
 	dailyReportHandler := worker.NewDailyReportHandler(

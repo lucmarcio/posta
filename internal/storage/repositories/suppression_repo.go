@@ -143,6 +143,35 @@ func (r *SuppressionRepository) IsSuppressedForList(scope ResourceScope, email s
 	return count > 0, err
 }
 
+// suppressionLookupChunk bounds IN (...) lists well below Postgres' 65535
+// bind-parameter limit.
+const suppressionLookupChunk = 5000
+
+// SuppressedSet returns which of emails carry a global suppression (list_id IS
+// NULL) in scope, keyed by normalized address.
+func (r *SuppressionRepository) SuppressedSet(scope ResourceScope, emails []string) (map[string]struct{}, error) {
+	out := make(map[string]struct{})
+	norm := make([]string, 0, len(emails))
+	for _, e := range emails {
+		if n := normalizeEmail(e); n != "" {
+			norm = append(norm, n)
+		}
+	}
+	for start := 0; start < len(norm); start += suppressionLookupChunk {
+		end := min(start+suppressionLookupChunk, len(norm))
+		var hits []string
+		if err := applyListPredicate(ApplyScope(r.db.Model(&models.Suppression{}), scope), nil).
+			Where("email IN ?", norm[start:end]).
+			Pluck("email", &hits).Error; err != nil {
+			return nil, err
+		}
+		for _, h := range hits {
+			out[h] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
 func (r *SuppressionRepository) FilterSuppressed(scope ResourceScope, emails []string) ([]string, error) {
 	return r.FilterSuppressedForList(scope, emails, nil)
 }

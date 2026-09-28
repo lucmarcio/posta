@@ -137,6 +137,7 @@ func runWorker() error {
 		campaignProducer,
 		campaignDispatcher,
 	)
+	campaignProcessor.SetSuppressionRepo(repositories.NewSuppressionRepository(db))
 
 	// Notification service + daily report handler
 	notifier := notification.NewService(

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +36,13 @@ type CampaignProcessor struct {
 	trackingService  *tracking.Service
 	producer         *Producer
 	dispatcher       *webhook.Dispatcher
+	suppressionRepo  *repositories.SuppressionRepository
+}
+
+// SetSuppressionRepo wires the suppression repository used to skip globally
+// suppressed recipients at campaign start.
+func (p *CampaignProcessor) SetSuppressionRepo(r *repositories.SuppressionRepository) {
+	p.suppressionRepo = r
 }
 
 func NewCampaignProcessor(
@@ -119,21 +127,22 @@ func (p *CampaignProcessor) HandleCampaignStart(_ context.Context, t *asynq.Task
 		suppressed = nil
 	}
 
-	// Create campaign messages in bulk
-	messages := make([]models.CampaignMessage, 0, len(subscribers))
-	for _, sub := range subscribers {
-		if sub.Status != models.SubscriberStatusSubscribed {
-			continue
+	var globalSuppressed map[string]struct{}
+	if p.suppressionRepo != nil {
+		emails := make([]string, 0, len(subscribers))
+		for _, sub := range subscribers {
+			emails = append(emails, sub.Email)
 		}
-		if _, opt := suppressed[sub.ID]; opt {
-			continue
+		// Fail closed: sending to a suppressed address burns sender reputation,
+		// so a lookup failure retries the task instead of sending blind.
+		globalSuppressed, err = p.suppressionRepo.SuppressedSet(scope, emails)
+		if err != nil {
+			return fmt.Errorf("failed to load global suppressions: %w", err)
 		}
-		messages = append(messages, models.CampaignMessage{
-			CampaignID:   campaign.ID,
-			SubscriberID: sub.ID,
-			Status:       models.CampaignMsgPending,
-		})
 	}
+
+	// Create campaign messages in bulk
+	messages := eligibleMessages(campaign.ID, subscribers, suppressed, globalSuppressed)
 
 	if len(messages) == 0 {
 		logger.Info("no eligible subscribers, marking campaign as sent", "id", campaign.ID)
@@ -192,6 +201,29 @@ func (p *CampaignProcessor) HandleCampaignStart(_ context.Context, t *asynq.Task
 		p.dispatcher.DispatchCampaign(campaign.UserID, campaign.WorkspaceID, "campaign.started", campaign.ID, campaign.Name, campaign.FromEmail)
 	}
 	return nil
+}
+
+// eligibleMessages builds pending messages for subscribers that are
+// subscribed, have not opted out of this list and carry no global suppression.
+func eligibleMessages(campaignID uint, subs []models.Subscriber, listOptOut map[uint]struct{}, globalSuppressed map[string]struct{}) []models.CampaignMessage {
+	messages := make([]models.CampaignMessage, 0, len(subs))
+	for _, sub := range subs {
+		if sub.Status != models.SubscriberStatusSubscribed {
+			continue
+		}
+		if _, opt := listOptOut[sub.ID]; opt {
+			continue
+		}
+		if _, blocked := globalSuppressed[strings.ToLower(strings.TrimSpace(sub.Email))]; blocked {
+			continue
+		}
+		messages = append(messages, models.CampaignMessage{
+			CampaignID:   campaignID,
+			SubscriberID: sub.ID,
+			Status:       models.CampaignMsgPending,
+		})
+	}
+	return messages
 }
 
 // HandleCampaignBatch processes a campaign:batch task.
