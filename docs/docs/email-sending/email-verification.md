@@ -56,7 +56,7 @@ Verification runs the following checks in order, returning early once the verdic
 5. **MX lookup** — the domain's mail exchangers are resolved. A domain with no MX (and no A/AAAA fallback) is `invalid`. A [null MX](https://www.rfc-editor.org/rfc/rfc7505) (`0 .`) is treated the same as no MX. A temporary DNS error (timeout, SERVFAIL) is `unknown` and is **not** cached, so it is retried on the next call.
 6. **SMTP RCPT probe** (only when `POSTA_EMAIL_VERIFY_SMTP_ENABLED=true`) — see [SMTP probe](#smtp-probe-optional).
 
-Suppressed/previously-bounced addresses short-circuit to `invalid` before any other check runs. For everything else, the verdict precedence is: invalid syntax → disposable → temporary DNS error (`unknown`) → no MX (`invalid`) → SMTP undeliverable (`invalid`) → role account (`risky`) → SMTP accept-all → valid.
+A malformed address is resolved to `invalid` on syntax alone and never reaches the suppression/bounce check. For a syntactically valid address, suppressed/previously-bounced addresses short-circuit to `invalid` before the disposable, MX and SMTP checks run. For everything else, the verdict precedence is: invalid syntax → disposable → temporary DNS error (`unknown`) → no MX (`invalid`) → SMTP undeliverable (`invalid`) → role account (`risky`) → SMTP accept-all → valid.
 
 ### Cache behavior
 
