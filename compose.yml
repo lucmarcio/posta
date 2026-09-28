@@ -23,6 +23,14 @@ services:
       POSTA_WEB_URL: https://mailer.isod.com.br
       POSTA_API_URL: https://mailer.isod.com.br        
       POSTA_SMTP_RELAY_HOSTNAME: smtp.isod.com.br
+      # System SMTP (invitations, password reset, notifications). Values come
+      # from .env (gitignored); left empty, platform emails are silently skipped.
+      POSTA_SYSTEM_SMTP_HOST: ${POSTA_SYSTEM_SMTP_HOST:-}
+      POSTA_SYSTEM_SMTP_PORT: ${POSTA_SYSTEM_SMTP_PORT:-587}
+      POSTA_SYSTEM_SMTP_USERNAME: ${POSTA_SYSTEM_SMTP_USERNAME:-}
+      POSTA_SYSTEM_SMTP_PASSWORD: ${POSTA_SYSTEM_SMTP_PASSWORD:-}
+      POSTA_SYSTEM_SMTP_FROM: ${POSTA_SYSTEM_SMTP_FROM:-}
+      POSTA_SYSTEM_SMTP_ENCRYPTION: ${POSTA_SYSTEM_SMTP_ENCRYPTION:-starttls}
 
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/healthz"]
