@@ -1906,7 +1906,7 @@ var popularSet = func() map[string]bool {
 // (Levenshtein distance 1–2 from a popular provider). Advisory only.
 func suggestDomain(domain string) string {
 	d := strings.ToLower(strings.TrimSpace(domain))
-	if len(d) < 6 || popularSet[d] {
+	if len(d) < 8 || popularSet[d] {
 		return ""
 	}
 	best, bestDist := "", 3
