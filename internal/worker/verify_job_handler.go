@@ -6,6 +6,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/goposta/posta/internal/storage/repositories"
 	"github.com/hibiken/asynq"
 	"github.com/jkaninda/logger"
+	"gorm.io/gorm"
 )
 
 // verifyJobChunk is how many pending items are verified and saved at a time.
@@ -39,7 +41,10 @@ func (h *VerifyJobHandler) ProcessTask(ctx context.Context, t *asynq.Task) (err 
 	}
 	job, err := h.jobs.FindByID(p.JobID)
 	if err != nil {
-		return fmt.Errorf("verify job %d not found: %w: %w", p.JobID, err, asynq.SkipRetry)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("verify job %d not found: %w: %w", p.JobID, err, asynq.SkipRetry)
+		}
+		return fmt.Errorf("verify job %d: load: %w", p.JobID, err) // transient: retry
 	}
 	if job.Status == models.EmailVerifyJobCompleted || job.Status == models.EmailVerifyJobFailed {
 		return nil
@@ -72,6 +77,12 @@ func (h *VerifyJobHandler) ProcessTask(ctx context.Context, t *asynq.Task) (err 
 		if err != nil {
 			return err
 		}
+		// A cancelled run fills unchecked addresses with "unknown"; saving them
+		// would take them out of the pending set for good. Leave the chunk
+		// pending so the retry verifies it for real.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if len(results) != len(items) {
 			return fmt.Errorf("verify job %s: %d results for %d items", job.UUID, len(results), len(items))
 		}
@@ -93,9 +104,6 @@ func (h *VerifyJobHandler) ProcessTask(ctx context.Context, t *asynq.Task) (err 
 		}
 		if err := h.jobs.SaveResults(job.ID, items); err != nil {
 			return err
-		}
-		if ctx.Err() != nil {
-			return ctx.Err() // resume on retry
 		}
 	}
 

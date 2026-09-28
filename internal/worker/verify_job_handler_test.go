@@ -6,6 +6,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"testing"
@@ -86,5 +87,69 @@ func TestVerifyJobProcessesPendingAndApplies(t *testing.T) {
 	scope := repositories.ResourceScope{UserID: u.ID, WorkspaceID: &ws}
 	if s, _ := sup.IsSuppressed(scope, "x@example.com"); !s {
 		t.Fatal("apply=true must suppress invalid addresses")
+	}
+}
+
+func TestVerifyJobCancelledRunLeavesChunkPending(t *testing.T) {
+	db := verifyTestDB(t)
+	tx := db.Begin()
+	defer tx.Rollback()
+
+	u := &models.User{Name: "t", Email: "verifyjob-cancel@example.com", PasswordHash: "x"}
+	if err := tx.Create(u).Error; err != nil {
+		t.Fatal(err)
+	}
+	ws := uint(8802)
+	jobs := repositories.NewEmailVerifyJobRepository(tx)
+	sup := repositories.NewSuppressionRepository(tx)
+	v := verifier.NewService(nil, sup, repositories.NewBounceRepository(tx), verifier.Options{Enabled: true})
+	v.SetResolver(jobResolver{})
+
+	job := &models.EmailVerifyJob{UserID: u.ID, WorkspaceID: &ws, Source: "emails"}
+	if err := jobs.CreateWithItems(job, []string{"a@good.com", "b@good.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h := NewVerifyJobHandler(jobs, v, sup)
+	payload, _ := json.Marshal(VerifyJobPayload{JobID: job.ID})
+	if err := h.ProcessTask(ctx, asynq.NewTask(TypeVerifyJob, payload)); err == nil {
+		t.Fatal("a cancelled run must return an error so the task is retried")
+	}
+
+	got, _ := jobs.FindByID(job.ID)
+	if got.Processed != 0 || got.Status == models.EmailVerifyJobCompleted {
+		t.Fatalf("job = %+v", got)
+	}
+	counts, _ := jobs.StatusCounts(job.ID)
+	if counts[models.EmailVerifyItemPending] != 2 {
+		t.Fatalf("items must stay pending after a cancelled run: %v", counts)
+	}
+}
+
+func TestVerifyJobMissingJobSkipsRetry(t *testing.T) {
+	db := verifyTestDB(t)
+	tx := db.Begin()
+	defer tx.Rollback()
+
+	h := NewVerifyJobHandler(repositories.NewEmailVerifyJobRepository(tx), nil, nil)
+	payload, _ := json.Marshal(VerifyJobPayload{JobID: 999999999})
+	err := h.ProcessTask(context.Background(), asynq.NewTask(TypeVerifyJob, payload))
+	if err == nil || !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("missing job must skip retry, got %v", err)
+	}
+}
+
+func TestVerifyJobLoadErrorIsRetried(t *testing.T) {
+	db := verifyTestDB(t)
+	tx := db.Begin()
+	tx.Rollback() // a finished transaction makes every query fail: a stand-in for a transient DB error
+
+	h := NewVerifyJobHandler(repositories.NewEmailVerifyJobRepository(tx), nil, nil)
+	payload, _ := json.Marshal(VerifyJobPayload{JobID: 1})
+	err := h.ProcessTask(context.Background(), asynq.NewTask(TypeVerifyJob, payload))
+	if err == nil || errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("a load error must be retried, got %v", err)
 	}
 }
