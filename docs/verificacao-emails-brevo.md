@@ -1,7 +1,10 @@
 # Verificação de e-mails e ciclo de bounce com a Brevo
 
 Notas de operação do fork local do Posta (`/devathenas/docker/posta`), escritas em 2026-09-28,
-sobre a branch `feat/email-verify`: fechamento do ciclo de bounce com a Brevo (webhook nativo +
+sobre o trabalho feito na branch `feat/email-verify` (27 commits, integrada por fast-forward em
+`chore/athenas-redis` e enviada para `origin` em 2026-09-28, `c3cedc2..cdb7eb0`). Design em
+`docs/superpowers/specs/2026-09-28-email-verify-design.md`; plano em
+`docs/superpowers/plans/2026-09-28-email-verify.md`. Cobre o fechamento do ciclo de bounce com a Brevo (webhook nativo +
 importação de bloqueados), o novo validador (verificação em lote/job, sonda SMTP opcional) e as
 mudanças de comportamento na supressão/bounce por tenant. Para a referência de request/response
 da API pública, veja `docs/docs/email-sending/email-verification.md`.
@@ -265,3 +268,52 @@ curl -s https://api.brevo.com/v3/webhooks -H "api-key: $BREVO_API_KEY" | grep -o
 
 # Importação repetida até next_offset == null (ver item 6)
 ```
+
+## 10. Por que os bounces passavam mesmo com lista validada (diagnóstico de 2026-09-28)
+
+- A Brevo, usada como relay SMTP, aceita qualquer `RCPT TO`; o bounce acontece depois, dentro dela.
+  O caminho síncrono `permanentRejection` (`internal/worker/handler.go`) nunca disparava, então o
+  Posta não aprendia com o bounce. O webhook (item 5) é o que fecha esse ciclo.
+- Ferramentas como o EmailVerify não enxergam domínios catch-all/gateways corporativos que aceitam no
+  `RCPT` e devolvem depois, nem caixas desativadas após a validação. A sonda própria (item 8) tem o
+  mesmo limite: por isso `accept_all` e `unknown` pedem envio em lotes pequenos, não "enviar".
+- O validador antigo transformava timeout de DNS em `invalid` (com cache de 24h) e aceitava null MX
+  (`0 .`) como MX válido — confirmado com `example.com`, para o qual o Go devolve `["."]`.
+
+## 11. Decisões tomadas na implementação (divergem ou completam o plano)
+
+- **Classificação SMTP:** o código enhanced decide. `5.1.x` → `undeliverable`, exceto `5.1.7`/`5.1.8`
+  (erro do *remetente*) → `unknown`; qualquer outra classe (`5.7.x` bloqueio de política, `5.2.x`)
+  → `unknown`. `550/551/553` **sem** código enhanced → `unknown` (`classifyRcpt` em
+  `internal/services/verifier/smtpprobe.go`). Motivo: um bloqueio do IP sondador não pode marcar a
+  caixa como inexistente — o resultado fica 7 dias em cache e, com `apply=true`, vira supressão.
+- **Sonda em blocos de 20 endereços por sessão**; se um bloco detectar catch-all, o domínio inteiro
+  vira `accept_all` sem novas sondas. A sessão é limitada a ~3× o timeout.
+- **Sonda nunca conecta em IP interno** (loopback, RFC1918, link-local, CGNAT) — checado no
+  `net.Dialer.Control`, depois da resolução DNS.
+- **Jobs sempre terminam:** chunk interrompido por cancelamento fica `pending` (não é salvo como
+  `unknown`); erro transitório de banco faz retry (`SkipRetry` só para job inexistente); panic na
+  última tentativa marca `failed`; jobs `queued/running` com mais de 24h não contam no limite de 2
+  ativos por workspace.
+- **Falhas de gravação** (webhook, importação, overlay de supressão) geram `logger.Warn` em vez de
+  sumirem.
+- **Lote rejeitado por rate limit não consome cota** (`DecrBy` em `checkRate`).
+- **Exportação CSV** escapa células que começam com `= + - @` (injeção de fórmula).
+
+## 12. Pendências conhecidas (não bloqueiam com a sonda desligada)
+
+- Retenção dos dados de job: endereços ficam para sempre em `email_verify_items`, e a exclusão de
+  contatos (LGPD) não apaga essa tabela — falta definir política (ex.: 30 dias) e um cron.
+- `/webhooks/brevo` aceita chave de API de qualquer escopo; `apply=true` suprime com chave `send`.
+- Sem limite por hora para jobs e sem limite de tamanho do corpo em `POST /emails/verify/jobs`.
+- Sonda: sem aviso quando o HELO cai em `localhost`; um `unknown` da sonda fica 7 dias em cache como
+  `valid`; `isForbiddenAddr` não cobre NAT64/6to4/`198.18.0.0/15`/`240.0.0.0/4`.
+- Jobs `queued/running` com mais de 24h deixam de contar no limite, mas ninguém os move para `failed`.
+
+## 13. Como eu errei nesta sessão (para não repetir)
+
+- Um implementador declarou "gofmt limpo" porque o comando `test -z "$(gofmt -l …)"` não imprimiu
+  nada — a saída é vazia tanto no sucesso quanto na falha. Sempre ecoar o exit code (`; echo exit=$?`).
+- Um revisor afirmou que `suppressions` não tinha índice único; existe (`idx_workspace_suppression`
+  em `internal/storage/migration/constraints.go`, criado por `rebuildUniqueIndexes`). Conferir DDL em
+  `constraints.go`, não só as tags do modelo, antes de aceitar esse tipo de achado.

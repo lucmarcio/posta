@@ -4,7 +4,7 @@ Notas de operação do fork local do Posta (`/devathenas/docker/posta`), escrita
 Cobre a integração com o Redis compartilhado do Athenas, dois bugs do upstream corrigidos
 aqui e a configuração de DNS para verificar domínios que já têm SPF.
 
-Branch local: `chore/athenas-redis` (commits `e699539`, `d14cfe7`, `a812917`, sem push).
+Branch: `chore/athenas-redis` (commits `e699539`, `d14cfe7`, `a812917`; enviada para `origin` em 2026-09-28 junto com a validação de e-mails — ver `docs/verificacao-emails-brevo.md`).
 
 ## 1. Redis externo (`athenas_redis`)
 
