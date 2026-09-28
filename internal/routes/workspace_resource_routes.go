@@ -846,6 +846,21 @@ func (r *Router) workspaceResourceRoutes() []okapi.RouteDefinition {
 			},
 		},
 		{
+			Method:      http.MethodPost,
+			Path:        pathSuppressions + "/import/brevo",
+			Handler:     okapi.H(r.h.brevoImport.Import),
+			Group:       opsGroup,
+			Tags:        []string{tagUser},
+			Summary:     "Import Brevo blocked contacts into the suppression list",
+			Description: "Pages Brevo's blocked/unsubscribed transactional contacts (100 per page, up to max_pages per call) and upserts them as suppressions. Call again with next_offset until it is null. The Brevo API key is not stored.",
+			Request:     &handlers.ImportBrevoRequest{},
+			Response:    &dto.Response[handlers.ImportBrevoResponse]{},
+			Options: []okapi.RouteOption{
+				okapi.DocErrorResponse(400, &dto.ErrorResponseBody{}),
+				okapi.DocErrorResponse(502, &dto.ErrorResponseBody{}),
+			},
+		},
+		{
 			Method:  http.MethodPost,
 			Path:    "/unsubscribe-lists",
 			Handler: okapi.H(r.h.unsubscribeList.Create),

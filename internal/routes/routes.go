@@ -16,6 +16,7 @@ import (
 	"github.com/goposta/posta/internal/services/audit"
 	"github.com/goposta/posta/internal/services/auth"
 	"github.com/goposta/posta/internal/services/bounceingest"
+	"github.com/goposta/posta/internal/services/brevo"
 	"github.com/goposta/posta/internal/services/cache"
 	"github.com/goposta/posta/internal/services/email"
 	"github.com/goposta/posta/internal/services/emailverify"
@@ -115,6 +116,7 @@ type routerHandlers struct {
 	tracking         *handlers.TrackingHandler
 	bounceWebhook    *handlers.BounceWebhookHandler
 	brevoWebhook     *handlers.BrevoWebhookHandler
+	brevoImport      *handlers.BrevoImportHandler
 	workspaceData    *handlers.WorkspaceDataHandler
 	plan             *handlers.PlanHandler
 	inbound          *handlers.InboundHandler
@@ -376,6 +378,7 @@ func InitRoutes(app *okapi.Okapi, db *gorm.DB, redisClient *redis.Client, cfg *c
 	bounceIngestor := bounceingest.New(emailRepo, bounceRepo, suppressionRepo, subscriberRepo, campaignMessageRepo)
 	r.h.bounceWebhook = handlers.NewBounceWebhookHandler(bounceIngestor)
 	r.h.brevoWebhook = handlers.NewBrevoWebhookHandler(bounceIngestor)
+	r.h.brevoImport = handlers.NewBrevoImportHandler(brevo.NewClient(), suppressionRepo)
 
 	// Inbound email
 	if cfg.InboundEnabled {
