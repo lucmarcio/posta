@@ -15,6 +15,7 @@ import (
 	"github.com/goposta/posta/internal/metrics"
 	"github.com/goposta/posta/internal/models"
 	"github.com/goposta/posta/internal/storage/repositories"
+	"github.com/jkaninda/logger"
 )
 
 type Kind string
@@ -94,13 +95,19 @@ func (in *Ingestor) Record(scope repositories.ResourceScope, ev Event) Outcome {
 		if err := in.bounces.Create(&models.Bounce{
 			UserID: em.UserID, WorkspaceID: em.WorkspaceID, EmailID: em.ID,
 			Recipient: email, Type: bt, Reason: ev.Reason,
-		}); err == nil {
+		}); err != nil {
+			warnWrite("bounce create", scope, ev, email, err)
+		} else {
 			out.BounceRecorded = true
 			metrics.IncrementBounce(string(bt))
 		}
 		if ev.Kind == KindHard || ev.Kind == KindSoft {
 			if msg, err := in.messages.FindByEmailID(em.ID); err == nil && msg != nil {
-				out.MessageMarked = in.messages.UpdateBouncedAt(msg.ID) == nil
+				if err := in.messages.UpdateBouncedAt(msg.ID); err != nil {
+					warnWrite("campaign message bounce mark", scope, ev, email, err)
+				} else {
+					out.MessageMarked = true
+				}
 			}
 		}
 	}
@@ -109,7 +116,9 @@ func (in *Ingestor) Record(scope repositories.ResourceScope, ev Event) Outcome {
 		if err := in.suppressions.Upsert(&models.Suppression{
 			UserID: scope.UserID, WorkspaceID: scope.WorkspaceID, Email: email, Kind: kind,
 			Reason: fmt.Sprintf("auto-suppressed (%s): %s", sourceOr(ev.Source), reasonOr(ev)),
-		}); err == nil {
+		}); err != nil {
+			warnWrite("suppression upsert", scope, ev, email, err)
+		} else {
 			out.Suppressed = true
 			metrics.IncrementSuppression()
 		}
@@ -120,7 +129,11 @@ func (in *Ingestor) Record(scope repositories.ResourceScope, ev Event) Outcome {
 			now := time.Now()
 			sub.Status = status
 			sub.UpdatedAt = &now
-			out.SubscriberUpdated = in.subscribers.Update(sub) == nil
+			if err := in.subscribers.Update(sub); err != nil {
+				warnWrite("subscriber update", scope, ev, email, err)
+			} else {
+				out.SubscriberUpdated = true
+			}
 		}
 	}
 
@@ -152,6 +165,17 @@ func (in *Ingestor) ownedEmail(scope repositories.ResourceScope, uuid string) *m
 		return nil
 	}
 	return em
+}
+
+// warnWrite logs a failed write so a lost bounce or suppression is visible.
+// Not-found lookups are expected and are not logged.
+func warnWrite(op string, scope repositories.ResourceScope, ev Event, email string, err error) {
+	var workspaceID uint
+	if scope.WorkspaceID != nil {
+		workspaceID = *scope.WorkspaceID
+	}
+	logger.Warn("bounceingest: write failed", "op", op, "source", sourceOr(ev.Source),
+		"email", email, "user_id", scope.UserID, "workspace_id", workspaceID, "error", err)
 }
 
 func bounceType(k Kind) models.BounceType {

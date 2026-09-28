@@ -146,3 +146,34 @@ func TestEmptyEmailIsIgnored(t *testing.T) {
 		t.Fatalf("action = %q", out.Action)
 	}
 }
+
+type failBounces struct{}
+
+func (failBounces) Create(*models.Bounce) error { return errors.New("db down") }
+
+type failSuppressions struct{}
+
+func (failSuppressions) Upsert(*models.Suppression) error { return errors.New("db down") }
+
+type failSubscribers struct{ fakeSubscribers }
+
+func (*failSubscribers) Update(*models.Subscriber) error { return errors.New("db down") }
+
+type failMessages struct{ fakeMessages }
+
+func (*failMessages) UpdateBouncedAt(uint) error { return errors.New("db down") }
+
+func TestWriteFailuresLeaveFlagsFalse(t *testing.T) {
+	emails := &fakeEmails{byUUID: map[string]*models.Email{
+		"11111111-1111-1111-1111-111111111111": {ID: 7, UserID: 1, WorkspaceID: u(10)},
+	}}
+	subs := &failSubscribers{fakeSubscribers{byEmail: map[string]*models.Subscriber{
+		"a@b.com": {ID: 3, Email: "a@b.com", Status: models.SubscriberStatusSubscribed},
+	}}}
+	in := New(emails, failBounces{}, failSuppressions{}, subs, &failMessages{})
+	out := in.Record(scope, Event{Email: "a@b.com", Kind: KindHard,
+		EmailUUID: "11111111-1111-1111-1111-111111111111", Source: "brevo"})
+	if out.BounceRecorded || out.Suppressed || out.SubscriberUpdated || out.MessageMarked || out.Action != ActionIgnored {
+		t.Fatalf("failed writes must not be reported as done: %+v", out)
+	}
+}
