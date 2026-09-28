@@ -122,6 +122,7 @@ type routerHandlers struct {
 	inbound          *handlers.InboundHandler
 	smtpCredential   *handlers.SMTPCredentialHandler
 	verify           *handlers.VerifyHandler
+	verifyJob        *handlers.VerifyJobHandler
 	form             *handlers.FormHandler
 	message          *handlers.MessageHandler
 	messageFilter    *handlers.MessageFilterHandler
@@ -349,6 +350,10 @@ func InitRoutes(app *okapi.Okapi, db *gorm.DB, redisClient *redis.Client, cfg *c
 	subscriberListRepo := repositories.NewSubscriberListRepository(db)
 	r.h.subscriber = handlers.NewSubscriberHandler(subscriberRepo)
 	r.h.subscriberList = handlers.NewSubscriberListHandler(subscriberListRepo, subscriberRepo)
+
+	// Bulk email verification jobs
+	verifyJobRepo := repositories.NewEmailVerifyJobRepository(db)
+	r.h.verifyJob = handlers.NewVerifyJobHandler(verifyJobRepo, subscriberListRepo, subscriberRepo, verifierSvc, producer)
 
 	// Campaigns
 	campaignRepo := repositories.NewCampaignRepository(db)
