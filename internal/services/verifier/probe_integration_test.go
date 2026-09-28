@@ -112,3 +112,46 @@ func TestProbeChunkingFillsAllResults(t *testing.T) {
 		}
 	}
 }
+
+// TestProbeChunkCatchAllShortCircuitsWholeDomain covers the controller
+// ruling's chunk-boundary case directly: when the FIRST chunk of a
+// multi-chunk domain reports catch-all, the whole domain must be treated as
+// accept_all — a single ProbeDomain call, no probing of later chunks, and
+// every pending address (including the ones past the first 20) resolved to
+// accept_all with none left unfilled.
+func TestProbeChunkCatchAllShortCircuitsWholeDomain(t *testing.T) {
+	s := NewService(nil, nil, nil, Options{Enabled: true, SMTPEnabled: true})
+	s.SetResolver(&countingResolver{calls: map[string]int{}})
+	p := &fakeProber{catchAll: true} // the first (and, if called again, every) chunk reports catch-all
+	emails := make([]string, 45)
+	for i := range emails {
+		emails[i] = fmt.Sprintf("u%02d@x.com", i)
+	}
+	s.SetProber(p)
+
+	res, err := s.VerifyMany(context.Background(), repositories.ResourceScope{UserID: 1}, emails, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if p.calls != 1 {
+		t.Fatalf("expected exactly 1 ProbeDomain call (short-circuit on first chunk's catch-all), got %d (sizes=%v)", p.calls, p.chunkSizes)
+	}
+	if len(p.chunkSizes) != 1 || p.chunkSizes[0] > 20 {
+		t.Fatalf("expected one chunk of at most 20 addresses, got sizes=%v", p.chunkSizes)
+	}
+	if len(res) != len(emails) {
+		t.Fatalf("expected %d results, got %d", len(emails), len(res))
+	}
+	for i, r := range res {
+		if r == nil {
+			t.Fatalf("res[%d] (%s) is missing", i, emails[i])
+		}
+		if r.Status != StatusAcceptAll {
+			t.Errorf("res[%d] (%s) Status = %s, want accept_all", i, emails[i], r.Status)
+		}
+		if r.Checks.SMTP != SMTPAcceptAll {
+			t.Errorf("res[%d] (%s) Checks.SMTP = %s, want accept_all", i, emails[i], r.Checks.SMTP)
+		}
+	}
+}
