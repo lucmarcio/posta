@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goposta/posta/internal/dto"
 	"github.com/goposta/posta/internal/models"
@@ -178,13 +179,35 @@ func isUniqueViolation(err error) bool {
 // normalizeJobResultsPageParams applies the results endpoint's own bounds
 // (default 100, max 1000), distinct from the generic list defaults.
 func normalizeJobResultsPageParams(page, size int) (int, int, int) {
-	if size <= 0 || size > 1000 {
+	if size <= 0 {
 		size = 100
+	}
+	if size > 1000 {
+		size = 1000
 	}
 	if page < 0 {
 		page = 0
 	}
 	return page, size, page * size
+}
+
+// maxIdempotencyKeyLen is the longest Idempotency-Key accepted, in characters
+// (the column is varchar(128)).
+const maxIdempotencyKeyLen = 128
+
+// idempotencyKeyTooLong reports whether key exceeds maxIdempotencyKeyLen.
+func idempotencyKeyTooLong(key string) bool {
+	return utf8.RuneCountInString(key) > maxIdempotencyKeyLen
+}
+
+// csvSafe neutralises spreadsheet formula injection: a cell starting with
+// =, +, -, @, tab or carriage return is prefixed with a single quote so
+// spreadsheet applications treat it as text.
+func csvSafe(s string) string {
+	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
+		return "'" + s
+	}
+	return s
 }
 
 // CreateVerifyJobRequest is the body for POST /emails/verify/jobs. Exactly one
@@ -211,6 +234,9 @@ func (h *VerifyJobHandler) CreateJob(c *okapi.Context, req *CreateVerifyJobReque
 
 	scope := getScope(c)
 	key := strings.TrimSpace(req.IdempotencyKey)
+	if idempotencyKeyTooLong(key) {
+		return c.AbortBadRequest(fmt.Sprintf("Idempotency-Key must be at most %d characters", maxIdempotencyKeyLen))
+	}
 	if key != "" {
 		existing, err := h.jobRepo.FindByIdempotencyKey(scope, key)
 		if err == nil {
@@ -381,7 +407,7 @@ func (h *VerifyJobHandler) ResultsCSV(c *okapi.Context, req *VerifyJobResultsCSV
 
 	iterErr := h.jobRepo.EachItem(job.ID, func(it models.EmailVerifyItem) error {
 		row := []string{
-			it.Email, it.Status, strconv.Itoa(it.Score), it.Reason, it.Suggestion,
+			csvSafe(it.Email), csvSafe(it.Status), strconv.Itoa(it.Score), csvSafe(it.Reason), csvSafe(it.Suggestion),
 			"", "", "", "", "", "",
 		}
 		if res := decodeItemResult(it.Result); res != nil {
@@ -390,11 +416,14 @@ func (h *VerifyJobHandler) ResultsCSV(c *okapi.Context, req *VerifyJobResultsCSV
 			row[7] = strconv.FormatBool(res.Checks.MX)
 			row[8] = strconv.FormatBool(res.Checks.Disposable)
 			row[9] = strconv.FormatBool(res.Checks.RoleAccount)
-			row[10] = string(res.Checks.SMTP)
+			row[10] = csvSafe(string(res.Checks.SMTP))
 		}
 		return w.Write(row)
 	})
 	w.Flush()
+	if err := w.Error(); err != nil {
+		c.Logger().Warn("verify job CSV write failed", "job_uuid", job.UUID, "error", err)
+	}
 	if iterErr != nil {
 		c.Logger().Warn("verify job CSV export failed", "job_uuid", job.UUID, "error", iterErr)
 	}
