@@ -11,6 +11,7 @@ import (
 	"github.com/goposta/posta/internal/models"
 	"github.com/goposta/posta/internal/services/brevo"
 	"github.com/goposta/posta/internal/storage/repositories"
+	"github.com/jkaninda/logger"
 	"github.com/jkaninda/okapi"
 )
 
@@ -115,7 +116,9 @@ func importBrevoBlocked(ctx context.Context, src blockedSource, sink suppression
 			if err := sink.Upsert(&models.Suppression{
 				UserID: scope.UserID, WorkspaceID: scope.WorkspaceID, Email: bc.Email,
 				Kind: brevoReasonKind(bc.Reason.Code), Reason: "imported from Brevo: " + bc.Reason.Code,
-			}); err == nil {
+			}); err != nil {
+				warnUpsertFailed(bc.Email, scope, err)
+			} else {
 				res.Imported++
 			}
 		}
@@ -127,6 +130,18 @@ func importBrevoBlocked(ctx context.Context, src blockedSource, sink suppression
 	}
 	res.NextOffset = &offset
 	return res, nil
+}
+
+// warnUpsertFailed logs a suppression write that failed during a Brevo
+// import, so a silently-dropped contact is visible. Never logs the Brevo
+// API key: only op/email/user/workspace/error are recorded.
+func warnUpsertFailed(email string, scope repositories.ResourceScope, err error) {
+	var workspaceID uint
+	if scope.WorkspaceID != nil {
+		workspaceID = *scope.WorkspaceID
+	}
+	logger.Warn("brevo import: suppression upsert failed", "op", "suppression upsert",
+		"email", email, "user_id", scope.UserID, "workspace_id", workspaceID, "error", err)
 }
 
 func brevoReasonKind(code string) models.SuppressionKind {

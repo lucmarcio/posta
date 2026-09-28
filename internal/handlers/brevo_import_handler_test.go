@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -36,6 +37,15 @@ type captureUpserts struct{ rows []models.Suppression }
 
 func (c *captureUpserts) Upsert(s *models.Suppression) error { c.rows = append(c.rows, *s); return nil }
 
+// failingUpserts fails every Upsert call, so a caller can assert that a
+// failed write is neither counted as Imported nor silently ignored.
+type failingUpserts struct{ calls int }
+
+func (f *failingUpserts) Upsert(*models.Suppression) error {
+	f.calls++
+	return errors.New("db down")
+}
+
 func TestImportBrevoBlockedPagesAndMapsKinds(t *testing.T) {
 	src := &fakeBlocked{total: 250}
 	sink := &captureUpserts{}
@@ -57,5 +67,26 @@ func TestImportBrevoBlockedPagesAndMapsKinds(t *testing.T) {
 	res, err = importBrevoBlocked(context.Background(), src, sink, scope, brevoImportParams{APIKey: "k", Offset: 200, MaxPages: 2})
 	if err != nil || res.Fetched != 50 || res.NextOffset != nil {
 		t.Fatalf("second call = %+v err=%v", res, err)
+	}
+}
+
+// TestImportBrevoBlockedFailedUpsertNotCountedButAttempted guards the
+// review fix: a failed suppression write must not be reported as
+// imported, but the import must still attempt every contact (not abort)
+// and must not crash for lack of logging plumbing.
+func TestImportBrevoBlockedFailedUpsertNotCountedButAttempted(t *testing.T) {
+	src := &fakeBlocked{total: 5}
+	sink := &failingUpserts{}
+	scope := repositories.ResourceScope{UserID: 1}
+
+	res, err := importBrevoBlocked(context.Background(), src, sink, scope, brevoImportParams{APIKey: "k", MaxPages: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Fetched != 5 || res.Imported != 0 {
+		t.Fatalf("res = %+v", res)
+	}
+	if sink.calls != 5 {
+		t.Fatalf("expected every contact to be attempted, calls = %d", sink.calls)
 	}
 }
