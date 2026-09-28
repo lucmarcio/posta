@@ -38,6 +38,8 @@ func (s *Stamper) StampCampaign(headers map[string]string, em *models.Email, cam
 
 	headers["Precedence"] = "bulk"
 	headers["Auto-Submitted"] = "auto-generated"
+
+	s.correlate(headers, em)
 }
 
 // StampTransactional adds the minimum set of correlation headers for API
@@ -49,6 +51,20 @@ func (s *Stamper) StampTransactional(headers map[string]string, em *models.Email
 	if em.APIKeyID != nil && *em.APIKeyID > 0 {
 		headers["X-Posta-API-Key-ID"] = fmt.Sprintf("%d", *em.APIKeyID)
 	}
+
+	s.correlate(headers, em)
+}
+
+// correlate stamps the Brevo custom header echoed back in its webhooks, so a
+// bounce can be tied to this email. A caller-supplied value is left alone.
+func (s *Stamper) correlate(headers map[string]string, em *models.Email) {
+	if em == nil || em.UUID == "" {
+		return
+	}
+	if _, exists := headers["X-Mailin-custom"]; exists {
+		return
+	}
+	headers["X-Mailin-custom"] = "posta-id=" + em.UUID
 }
 
 // Sign writes X-Posta-Signature over a canonical string of stable message

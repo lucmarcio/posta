@@ -6,6 +6,7 @@ package routes
 import (
 	"net/http"
 
+	"github.com/goposta/posta/internal/dto"
 	"github.com/goposta/posta/internal/handlers"
 	"github.com/jkaninda/okapi"
 )
@@ -79,6 +80,11 @@ func (r *Router) bounceWebhookRoutes() []okapi.RouteDefinition {
 		Description: "Inbound webhook endpoints that receive bounce and complaint notifications from upstream mail providers. Authenticated with an API key.",
 	}).WithSecurity([]map[string][]string{{"ApiKeyAuth": {}}})
 
+	brevoGroup := r.v1.Group("/webhooks/brevo", r.mw.apiKey).WithTagInfo(okapi.GroupTag{
+		Name:        "Webhooks",
+		Description: "Inbound webhook endpoints that receive bounce and complaint notifications from upstream mail providers. Authenticated with an API key.",
+	}).WithSecurity([]map[string][]string{{"ApiKeyAuth": {}}})
+
 	return []okapi.RouteDefinition{
 		{
 			Method:   http.MethodPost,
@@ -88,6 +94,15 @@ func (r *Router) bounceWebhookRoutes() []okapi.RouteDefinition {
 			Summary:  "Bounce notification webhook",
 			Request:  &handlers.BounceNotification{},
 			Response: &handlers.BounceResponse{},
+		},
+		{
+			Method:      http.MethodPost,
+			Path:        "",
+			Handler:     r.h.brevoWebhook.Handle,
+			Group:       brevoGroup,
+			Summary:     "Brevo webhook (bounces, complaints, unsubscribes)",
+			Description: "Receives Brevo transactional or marketing webhook events, single or batched. Hard bounces, invalid and blocked recipients are suppressed; spam complaints are suppressed as complaints; soft bounces are only recorded. Configure the webhook in Brevo with an Authorization header carrying a Posta API key.",
+			Response:    &dto.Response[handlers.BrevoWebhookResponse]{},
 		},
 	}
 }

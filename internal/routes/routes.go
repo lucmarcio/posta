@@ -114,6 +114,7 @@ type routerHandlers struct {
 	campaign         *handlers.CampaignHandler
 	tracking         *handlers.TrackingHandler
 	bounceWebhook    *handlers.BounceWebhookHandler
+	brevoWebhook     *handlers.BrevoWebhookHandler
 	workspaceData    *handlers.WorkspaceDataHandler
 	plan             *handlers.PlanHandler
 	inbound          *handlers.InboundHandler
@@ -374,6 +375,7 @@ func InitRoutes(app *okapi.Okapi, db *gorm.DB, redisClient *redis.Client, cfg *c
 	// bounceIngestor is shared by every bounce webhook (generic and provider-specific).
 	bounceIngestor := bounceingest.New(emailRepo, bounceRepo, suppressionRepo, subscriberRepo, campaignMessageRepo)
 	r.h.bounceWebhook = handlers.NewBounceWebhookHandler(bounceIngestor)
+	r.h.brevoWebhook = handlers.NewBrevoWebhookHandler(bounceIngestor)
 
 	// Inbound email
 	if cfg.InboundEnabled {
