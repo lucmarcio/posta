@@ -232,7 +232,11 @@ Requisitos para rodar em produção:
 
 - **Porta 25 de saída liberada.** Em VM de nuvem e no WSL essa porta costuma vir bloqueada pelo
   provedor/host; sem ela a sonda não conecta e o resultado degrada para `checks.smtp = "unknown"`
-  silenciosamente (sem erro visível na resposta).
+  silenciosamente (sem erro visível na resposta). Neste ambiente (WSL), em 2026-09-28 a porta 25
+  de saída estava **aberta** (teste com `/dev/tcp/gmail-smtp-in.l.google.com/25`); o limitante local
+  é o IP residencial sem rDNS, que Gmail e outros costumam recusar — resultado `unknown`. Yahoo
+  aceita qualquer `RCPT` e tende a sair `accept_all`. Enquanto a sonda estiver desligada, o CSV do
+  lote/job mostra `smtp = skipped`.
 - **IP diferente do IP usado para enviar e-mail**, com rDNS (PTR) coerente com o HELO configurado
   em `POSTA_EMAIL_VERIFY_SMTP_HELO`. Sondar a partir do próprio IP de envio arrisca fazer esse IP
   ser sinalizado por provedores destinatários como tráfego suspeito (RCPT sem DATA em série).
