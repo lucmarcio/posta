@@ -186,13 +186,17 @@ func (s *session) Data(r io.Reader) error {
 		})
 	}
 
+	pt := extractPassthrough(parsed, s.from)
+
 	req := &email.SendRequest{
-		From:        s.from,
+		From:        pt.from,
 		To:          s.to,
 		Subject:     parsed.Subject,
 		HTML:        parsed.HTMLBody,
 		Text:        parsed.TextBody,
 		Attachments: attachments,
+		Headers:     pt.headers,
+		Unsubscribe: pt.unsubscribe,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
