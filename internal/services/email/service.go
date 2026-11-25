@@ -315,6 +315,12 @@ func (s *Service) resolveUnsubscribe(scope repositories.ResourceScope, req *Send
 		mailto = "mailto:" + mailto
 	}
 
+	// Both values are written verbatim into the List-Unsubscribe header, so a
+	// CR/LF (or any control character) would inject headers.
+	if containsControlChars(u.URL) || containsControlChars(mailto) {
+		return nil, fmt.Errorf("%w: url and mailto must not contain control characters", ErrUnsubscribeInvalid)
+	}
+
 	// The one-click URL for a Posta-managed list is minted later, since it needs the email id.
 	if u.ListID != nil {
 		if s.unsubRepo == nil {
@@ -835,7 +841,10 @@ func (s *Service) sendSync(em *models.Email, userID uint, workspaceID *uint, req
 	em.SMTPHostname = smtpServer.Host
 	_ = s.emailRepo.Update(em)
 
-	if err := s.sender.Send(smtpServer, req.From, req.To, req.Subject, req.HTML, req.Text, req.Attachments, req.Headers, em.ListUnsubscribeURL, em.ListUnsubscribeMailto, em.ListUnsubscribePost); err != nil {
+	// Deliver the stored headers, which Send already gated on the custom-headers
+	// setting and filtered. Using req.Headers here would bypass both and make this
+	// path differ from the worker's.
+	if err := s.sender.Send(smtpServer, req.From, req.To, req.Subject, req.HTML, req.Text, req.Attachments, storedHeaders(em.HeadersJSON), em.ListUnsubscribeURL, em.ListUnsubscribeMailto, em.ListUnsubscribePost); err != nil {
 		em.Status = models.EmailStatusFailed
 		em.ErrorMessage = err.Error()
 		_ = s.emailRepo.Update(em)
@@ -1302,6 +1311,11 @@ func filterCustomHeaders(headers map[string]string) map[string]string {
 
 	filtered := make(map[string]string, len(headers))
 	for key, value := range headers {
+		// Headers are written verbatim as "Key: value\r\n": a bad name or a
+		// control character in the value would inject headers.
+		if !validHeaderName(key) || containsControlChars(value) {
+			continue
+		}
 		lower := strings.ToLower(key)
 		if reserved[lower] {
 			continue
@@ -1319,6 +1333,48 @@ func filterCustomHeaders(headers map[string]string) map[string]string {
 		filtered[key] = value
 	}
 	return filtered
+}
+
+// containsControlChars reports whether s has a control character (CR, LF, NUL,
+// tab and the rest of C0, or DEL).
+func containsControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// validHeaderName accepts RFC 7230 token characters only, which excludes the
+// colon, spaces and every control character.
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// storedHeaders returns the custom headers persisted on an email (JSON written
+// by Send after the setting check and filterCustomHeaders), the same source the
+// worker uses. A missing or unreadable value yields no headers.
+func storedHeaders(headersJSON string) map[string]string {
+	if headersJSON == "" {
+		return nil
+	}
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(headersJSON), &headers); err != nil {
+		return nil
+	}
+	return headers
 }
 
 func (s *Service) applyDefaultSenderName(workspaceID *uint, from string) string {
